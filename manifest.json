@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Tsun Importer",
+  "version": "9.1",
+  "description": "Importer for Comick CSV & Weebcentral TXT into Atsu.moe",
+  "author": "Archanos",
+  "icons": {
+    "128": "./icons/icon128.png"
+  },
+  "action": {
+    "default_icon": {
+      "128": "./icons/icon128.png"
+    },
+    "default_title": "Tsun Importer"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://atsu.moe/*", "*://www.atsu.moe/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "https://atsu.moe/*"
+  ]
+}
