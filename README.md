@@ -1,6 +1,6 @@
 # Tsun Importer
 
-A sleek, ultra-glassmorphic Chrome extension to bulk import your manga library (Comick `.csv` or Weebcentral/MangaUpdates `.txt`) directly into [Atsu.moe](https://atsu.moe).
+A Chrome extension to bulk import your manga library (Comick `.csv` or Weebcentral/MangaUpdates `.txt`) directly into [Atsu.moe](https://atsu.moe).
 
 ## Features
 * **Smart Mapping:** Uses Atsu's `tracker-map.json` with an API search fallback.
