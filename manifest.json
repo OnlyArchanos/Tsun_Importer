@@ -1,26 +1,43 @@
 {
   "manifest_version": 3,
   "name": "Tsun Importer",
-  "version": "9.1",
-  "description": "Importer for Comick CSV & Weebcentral TXT into Atsu.moe",
-  "author": "Archanos",
+  "version": "2.0.0",
+  "description": "Bulk import your manga library (Comick .csv, MU/Weebcentral .txt, or MAL .xml) into Atsu.moe.",
   "icons": {
-    "128": "./icons/icon128.png"
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
   },
-  "action": {
-    "default_icon": {
-      "128": "./icons/icon128.png"
-    },
-    "default_title": "Tsun Importer"
+
+  "background": {
+    "service_worker": "background.js"
   },
+
   "content_scripts": [
     {
-      "matches": ["*://atsu.moe/*", "*://www.atsu.moe/*"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
+      "matches": ["https://atsu.moe/*"],
+      "js":      ["content.js"],
+      "run_at":  "document_idle"
     }
   ],
+
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms"
+  ],
+
   "host_permissions": [
-    "https://atsu.moe/*"
-  ]
+    "https://atsu.moe/*",
+    "https://api.mangaupdates.com/*"
+  ],
+
+  "action": {
+    "default_title": "Tsun Importer",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
 }
