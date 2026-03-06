@@ -1,1534 +1,1188 @@
 // ═══════════════════════════════════════════════════════════════════
-//  Tsun Importer — content.js
-//  Supports: Comick .csv | Weebcentral/MangaUpdates .txt | MAL .xml
+//  Tsun Importer — content.js  v3.0
 // ═══════════════════════════════════════════════════════════════════
-
 (function () {
   'use strict';
 
-  /* ═══════════════════════════════════════════════════════════════
-     CONSTANTS
-  ═══════════════════════════════════════════════════════════════ */
-  const ATSU_TRACKER_MAP_URL  = 'https://atsu.moe/tracker-map.json';
-  const ATSU_SEARCH_URL       = 'https://atsu.moe/api/search';
-  const ATSU_BOOKMARK_URL     = 'https://atsu.moe/api/bookmark';
-  const MU_SEARCH_URL         = 'https://api.mangaupdates.com/v1/series/search';
+  /* ── Constants ──────────────────────────────────────────────── */
+  const ATSU_TRACKER_MAP_URL = 'https://atsu.moe/tracker-map.json';
+  const ATSU_SEARCH_PATH     = '/collections/manga/documents/search';
+  const ATSU_BOOKMARKS_PATH  = '/api/user/syncBookmarks';
+  const ATSU_CHAPTERS_PATH   = '/api/manga/allChapters';
+  const ATSU_PROGRESS_PATH   = '/api/read/syncProgress';
+  const LS_RESUME_KEY        = 'tsunImporter_resumeState';
+  const LS_RESOLVED_KEY      = 'tsunImporter_phase2Resolved';
+  const TRACKER_MAP_TTL_MS   = 30 * 60 * 1000;
+  const SEARCH_CONCURRENCY   = 6;
+  const SEARCH_DELAY_MS      = 80;
+  const BOOKMARK_CHUNK       = 10;
+  const BOOKMARK_DELAY_MS    = 350;
+  const STATUS_MAP = {
+    'Reading':'Reading','Completed':'Completed','Dropped':'Dropped',
+    'Plan to Read':'PlanToRead','Planned':'PlanToRead',
+    'On-Hold':'OnHold','Paused':'OnHold',
+    'Re-Reading':'ReReading','Rereading':'ReReading',
+  };
 
-  const LS_RESUME_KEY         = 'tsunImporter_resumeState';
-  const LS_RESOLVED_KEY       = 'tsunImporter_phase2Resolved'; // separate key — avoids per-iteration MB writes
-  const LS_MAL_CACHE_KEY      = 'tsunImporter_malCache';
+  /* ── State ──────────────────────────────────────────────────── */
+  let importQueue=[],importIndex=0,isPaused=false,isRunning=false,isCancelled=false;
+  let failedEntries=[],pendingEntries=[],currentFormat=null;
+  let trackerArr=null,trackerByMal={},trackerByMu={},trackerFetchedAt=0;
 
-  const TRACKER_MAP_TTL_MS    = 30 * 60 * 1000; // 30 min staleness
-  const MU_BASE_DELAY_MS      = 350;
-  const MAX_MU_RETRIES        = 4;
-
-  /* ═══════════════════════════════════════════════════════════════
-     STATE
-  ═══════════════════════════════════════════════════════════════ */
-  let importQueue          = [];
-  let importIndex          = 0;
-  let isPaused             = false;
-  let isRunning            = false;
-  let isCancelled          = false;
-  let trackerMap           = null;
-  let trackerMapFetchedAt  = 0;
-  let reverseTrackerMap    = null;
-  let failedEntries        = [];
-  let pendingEntries       = [];
-  let currentFormat        = null; // 'csv' | 'txt' | 'xml'
-  let malResolutionCache   = {};
-  let currentPhase2Resolved = []; // module-level so cancel handler can export it
-
-  /* ═══════════════════════════════════════════════════════════════
-     STYLES
-  ═══════════════════════════════════════════════════════════════ */
+  /* ── Styles ─────────────────────────────────────────────────── */
   const style = document.createElement('style');
   style.textContent = `
-    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap');
 
-    @keyframes tsun-fadeSlideUp {
-      from { opacity: 0; transform: translateY(6px); }
-      to   { opacity: 1; transform: translateY(0);   }
-    }
-    @keyframes tsun-shimmer {
-      0%   { transform: translateX(-100%); }
-      100% { transform: translateX(400%);  }
-    }
-    @keyframes tsun-pulse {
-      0%, 100% { opacity: 1;   }
-      50%       { opacity: 0.4; }
-    }
-    @keyframes tsun-spin {
-      to { transform: rotate(360deg); }
-    }
-    @keyframes tsun-pop {
-      0%   { transform: scale(0.92); opacity: 0; }
-      60%  { transform: scale(1.03);             }
-      100% { transform: scale(1);    opacity: 1; }
-    }
-    @keyframes tsun-rowIn {
-      from { opacity: 0; transform: translateX(-4px); }
-      to   { opacity: 1; transform: translateX(0);    }
-    }
+/* ── Keyframes ── */
+@keyframes t-in    {from{opacity:0;transform:translateY(22px) scale(.95)}to{opacity:1;transform:none}}
+@keyframes t-up    {from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+@keyframes t-pop   {0%{opacity:0;transform:scale(.84)}60%{transform:scale(1.06)}100%{opacity:1;transform:none}}
+@keyframes t-shim  {0%{transform:translateX(-120%)}100%{transform:translateX(420%)}}
+@keyframes t-pulse {0%,100%{opacity:1}50%{opacity:.28}}
+@keyframes t-spin  {to{transform:rotate(360deg)}}
+@keyframes t-glow  {0%,100%{box-shadow:0 0 0 0 rgba(255,107,107,0)}50%{box-shadow:0 0 20px 4px rgba(255,107,107,.3)}}
+@keyframes t-row   {from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+@keyframes t-dot   {0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.7);opacity:.7}}
+@keyframes t-toast {0%{opacity:0;transform:translateY(8px) scale(.95)}15%{opacity:1;transform:none}80%{opacity:1}100%{opacity:0;transform:translateY(-4px)}}
+@keyframes t-num   {from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+@keyframes t-flip  {0%{transform:scaleY(1)}50%{transform:scaleY(0)}100%{transform:scaleY(1)}}
+@keyframes t-border{0%,100%{border-color:rgba(255,255,255,.1)}50%{border-color:rgba(255,107,107,.4)}}
+@keyframes t-confetti{0%{transform:translateY(0) rotate(0deg);opacity:1}100%{transform:translateY(-60px) rotate(360deg);opacity:0}}
+@keyframes t-wipe  {from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0% 0 0)}}
 
-    .tsun-reveal { animation: tsun-fadeSlideUp 0.22s cubic-bezier(0.4,0,0.2,1) both; }
-    .tsun-pop    { animation: tsun-pop 0.28s cubic-bezier(0.34,1.56,0.64,1) both; }
+/* ── Panel shell — width/height set via JS, no !important on those ── */
+#tsun-panel{
+  position:fixed!important;
+  bottom:24px!important;right:24px!important;
+  /* width/height set by JS after creation */
+  min-width:280px!important;min-height:120px!important;max-width:800px!important;max-height:96vh!important;
+  background:rgba(9,9,15,.9)!important;
+  backdrop-filter:blur(36px) saturate(200%)!important;
+  -webkit-backdrop-filter:blur(36px) saturate(200%)!important;
+  border:1px solid rgba(255,255,255,.1)!important;
+  border-radius:14px!important;
+  box-shadow:0 48px 100px rgba(0,0,0,.85),0 10px 32px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.08)!important;
+  font-family:'Syne',system-ui,sans-serif!important;
+  color:#e4e4ec!important;
+  z-index:2147483647!important;
+  overflow:hidden!important;
+  animation:t-in .42s cubic-bezier(.34,1.1,.64,1) both!important;
+  user-select:none!important;
+  display:flex!important;flex-direction:column!important;
+  transition:box-shadow .3s!important;
+}
+#tsun-panel::before{
+  content:''!important;position:absolute!important;inset:0!important;border-radius:14px!important;
+  background:linear-gradient(155deg,rgba(255,255,255,.06) 0%,transparent 30%)!important;
+  pointer-events:none!important;z-index:0!important;
+}
+#tsun-panel.t-resizing{cursor:se-resize!important;transition:none!important}
+#tsun-panel.t-drag-active{box-shadow:0 64px 120px rgba(0,0,0,.9),0 16px 48px rgba(0,0,0,.65),inset 0 1px 0 rgba(255,255,255,.08)!important;transition:none!important}
 
-    #tsun-panel {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      width: 388px;
-      background: #0c0c0f;
-      border: 1px solid #252530;
-      border-radius: 16px;
-      box-shadow: 0 32px 80px rgba(0,0,0,0.8),
-                  0 0 0 1px rgba(255,255,255,0.04) inset;
-      font-family: 'Syne', sans-serif;
-      color: #e8e8ec;
-      z-index: 99999;
-      overflow: hidden;
-    }
+/* ── Resize handles (all 8 edges+corners) ── */
+.t-rz{position:absolute!important;z-index:20!important;user-select:none!important}
+.t-rz-se{bottom:0!important;right:0!important;width:18px!important;height:18px!important;cursor:se-resize!important;
+  background:radial-gradient(circle,rgba(255,255,255,.2) 1px,transparent 1px) 3px 3px/4px 4px,
+             radial-gradient(circle,rgba(255,255,255,.2) 1px,transparent 1px) 7px 7px/4px 4px,
+             radial-gradient(circle,rgba(255,255,255,.2) 1px,transparent 1px) 11px 11px/4px 4px!important}
+.t-rz-e {top:18px!important;right:0!important;width:5px!important;bottom:18px!important;cursor:e-resize!important;
+  background:linear-gradient(transparent,rgba(255,255,255,.06),transparent)!important;}
+.t-rz-s {left:18px!important;bottom:0!important;height:5px!important;right:18px!important;cursor:s-resize!important;
+  background:linear-gradient(to right,transparent,rgba(255,255,255,.06),transparent)!important;}
+.t-rz-w {top:18px!important;left:0!important;width:5px!important;bottom:18px!important;cursor:w-resize!important}
+.t-rz-n {left:18px!important;top:0!important;height:5px!important;right:18px!important;cursor:n-resize!important}
+.t-rz-ne{top:0!important;right:0!important;width:18px!important;height:18px!important;cursor:ne-resize!important}
+.t-rz-sw{bottom:0!important;left:0!important;width:18px!important;height:18px!important;cursor:sw-resize!important}
+.t-rz-nw{top:0!important;left:0!important;width:18px!important;height:18px!important;cursor:nw-resize!important}
 
-    #tsun-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 13px 16px;
-      background: #111118;
-      border-bottom: 1px solid #1c1c26;
-      cursor: pointer;
-      user-select: none;
-    }
-    #tsun-header-left { display: flex; align-items: center; gap: 9px; }
+/* ── Header ── */
+#tsun-header{
+  display:flex!important;align-items:center!important;justify-content:space-between!important;
+  padding:11px 14px!important;background:rgba(255,255,255,.025)!important;
+  border-bottom:1px solid rgba(255,255,255,.07)!important;
+  cursor:grab!important;position:relative!important;z-index:2!important;flex-shrink:0!important;
+  transition:background .2s!important;
+}
+#tsun-header:hover{background:rgba(255,255,255,.038)!important}
+#tsun-header:active{cursor:grabbing!important}
+#tsun-header-left{display:flex!important;align-items:center!important;gap:9px!important}
+#tsun-dot{
+  width:8px!important;height:8px!important;border-radius:50%!important;
+  background:rgba(255,255,255,.18)!important;flex-shrink:0!important;
+  transition:background .4s,box-shadow .4s!important;
+}
+#tsun-dot.running{background:#4dde8e!important;box-shadow:0 0 8px #4dde8e88!important;animation:t-dot 1.4s ease-in-out infinite!important}
+#tsun-dot.paused {background:#ffd966!important;box-shadow:0 0 6px #ffd96688!important}
+#tsun-dot.done   {background:#4daede!important;box-shadow:0 0 8px #4daede88!important}
+#tsun-dot.error  {background:#ff6b6b!important;box-shadow:0 0 8px #ff6b6b88!important}
+#tsun-title{font-size:12px!important;font-weight:700!important;letter-spacing:.08em!important;text-transform:uppercase!important;color:#c8c8d8!important}
+#tsun-badge{
+  font-family:'DM Mono',monospace!important;font-size:9px!important;padding:2px 7px!important;
+  border-radius:4px!important;display:none!important;font-weight:500!important;letter-spacing:.06em!important;text-transform:uppercase!important;
+  transition:opacity .2s,transform .2s!important;
+}
+#tsun-badge.csv{background:rgba(77,222,142,.12)!important;color:#4dde8e!important;display:inline-block!important;border:1px solid rgba(77,222,142,.25)!important}
+#tsun-badge.txt{background:rgba(77,174,222,.12)!important;color:#4daede!important;display:inline-block!important;border:1px solid rgba(77,174,222,.25)!important}
+#tsun-badge.xml{background:rgba(222,77,174,.12)!important;color:#de4dae!important;display:inline-block!important;border:1px solid rgba(222,77,174,.25)!important}
 
-    #tsun-logo {
-      width: 28px; height: 28px;
-      background: linear-gradient(135deg, #ff6b6b, #ff3333);
-      border-radius: 8px;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 11px; font-weight: 800; color: #fff;
-      letter-spacing: -0.5px; flex-shrink: 0;
-      box-shadow: 0 2px 8px rgba(255,68,68,0.4);
-    }
-    #tsun-title { font-size: 13px; font-weight: 700; letter-spacing: 0.04em; color: #f0f0f5; }
+/* Mini-stats (shown in header when collapsed) */
+#tsun-mini{
+  display:none!important;align-items:center!important;gap:10px!important;
+  font-family:'DM Mono',monospace!important;font-size:10px!important;
+}
+#tsun-mini.show{display:flex!important}
+.t-ms{color:#3a3a52!important;transition:color .3s!important}
+.t-ms.lit{color:#4dde8e!important}
 
-    #tsun-badge {
-      font-family: 'DM Mono', monospace;
-      font-size: 10px; padding: 2px 7px; border-radius: 4px;
-      font-weight: 500; letter-spacing: 0.05em; display: none;
-    }
-    #tsun-badge.csv { background:#1a3a2a; color:#4dde8e; display:inline-block; }
-    #tsun-badge.txt { background:#1a2a3a; color:#4daede; display:inline-block; }
-    #tsun-badge.xml { background:#3a1a2a; color:#de4dae; display:inline-block; }
+#tsun-wc{display:flex!important;align-items:center!important;gap:6px!important}
+.tsun-wc-btn{
+  width:12px!important;height:12px!important;border-radius:50%!important;border:none!important;
+  cursor:pointer!important;padding:0!important;transition:filter .15s,transform .12s,box-shadow .15s!important;flex-shrink:0!important;
+}
+.tsun-wc-btn:hover{filter:brightness(1.4)!important;transform:scale(1.18)!important}
+.tsun-wc-btn:active{transform:scale(.88)!important}
+#tsun-min-btn {background:#ffd04c!important}
+#tsun-close-btn{background:#ff6058!important}
 
-    #tsun-toggle-btn {
-      background:none; border:none; color:#555; cursor:pointer;
-      font-size:17px; line-height:1; padding:0; transition:color 0.2s;
-    }
-    #tsun-toggle-btn:hover { color:#aaa; }
+/* ── Body ── */
+#tsun-body{
+  padding:13px 14px 12px!important;position:relative!important;z-index:1!important;
+  overflow-y:auto!important;flex:1!important;display:flex!important;flex-direction:column!important;
+}
+#tsun-body::-webkit-scrollbar{width:3px!important}
+#tsun-body::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1)!important;border-radius:2px!important}
+#tsun-body::-webkit-scrollbar-track{background:transparent!important}
 
-    #tsun-body { padding: 14px 16px; max-height: 82vh; overflow-y: auto; }
-    #tsun-body::-webkit-scrollbar { width:4px; }
-    #tsun-body::-webkit-scrollbar-track { background:transparent; }
-    #tsun-body::-webkit-scrollbar-thumb { background:#2a2a38; border-radius:2px; }
+/* ── Dropzone ── */
+#tsun-dropzone{
+  border:1.5px dashed rgba(255,255,255,.1)!important;border-radius:11px!important;
+  padding:22px 16px!important;text-align:center!important;cursor:pointer!important;
+  transition:border-color .2s,background .2s,transform .18s,box-shadow .2s!important;
+  margin-bottom:10px!important;background:rgba(255,255,255,.016)!important;
+  position:relative!important;overflow:hidden!important;
+}
+#tsun-dropzone::after{
+  content:''!important;position:absolute!important;inset:0!important;border-radius:9px!important;
+  background:linear-gradient(135deg,rgba(255,255,255,.03) 0%,transparent 60%)!important;
+  pointer-events:none!important;
+}
+#tsun-dropzone:hover{border-color:rgba(255,255,255,.2)!important;background:rgba(255,255,255,.03)!important;transform:translateY(-1px)!important;box-shadow:0 4px 20px rgba(0,0,0,.3)!important}
+#tsun-dropzone.drag-over{
+  border-color:#ff6b6b!important;background:rgba(255,107,107,.07)!important;
+  transform:scale(1.016) translateY(-1px)!important;
+  animation:t-glow 1s ease-in-out infinite,t-border 1s ease-in-out infinite!important;
+}
+#tsun-dropzone.locked{cursor:not-allowed!important;opacity:.28!important;pointer-events:none!important}
+#tsun-dz-icon{font-size:22px!important;margin-bottom:6px!important;display:block!important;transition:transform .2s!important}
+#tsun-dropzone:hover #tsun-dz-icon{transform:scale(1.12) translateY(-2px)!important}
+#tsun-dropzone.drag-over #tsun-dz-icon{transform:scale(1.25)!important;animation:t-flip .4s ease-in-out!important}
+#tsun-dz-text{font-size:12px!important;color:#505068!important;line-height:1.6!important}
+#tsun-dz-text strong{color:#888!important;font-weight:600!important;display:block!important;margin-bottom:2px!important}
+#tsun-dz-hint{font-size:10px!important;color:#2e2e42!important;margin-top:5px!important;font-family:'DM Mono',monospace!important}
+#tsun-file-input{display:none!important}
 
-    /* ── Dropzone ── */
-    #tsun-dropzone {
-      border: 1.5px dashed #2a2a38;
-      border-radius: 10px;
-      padding: 26px 16px;
-      text-align: center;
-      cursor: pointer;
-      transition: border-color 0.2s, background 0.2s, transform 0.15s;
-      margin-bottom: 12px;
-    }
-    #tsun-dropzone:hover { border-color: #3a3a50; background: rgba(255,255,255,0.015); }
-    #tsun-dropzone.drag-over {
-      border-color: #ff6b6b;
-      background: rgba(255,107,107,0.07);
-      transform: scale(1.01);
-    }
-    #tsun-dropzone.running-lock { cursor: not-allowed; opacity: 0.4; }
-    #tsun-dropzone-icon { font-size: 24px; margin-bottom: 6px; }
-    #tsun-dropzone-text { font-size: 12px; color: #777; line-height: 1.5; }
-    #tsun-dropzone-text strong { color: #aaa; font-weight: 600; }
-    #tsun-file-input { display: none; }
+/* ── Cards ── */
+.t-card{
+  background:rgba(255,255,255,.03)!important;border:1px solid rgba(255,255,255,.065)!important;
+  border-radius:10px!important;padding:10px 12px!important;margin-bottom:10px!important;
+  transition:border-color .2s,background .2s!important;
+}
+.t-card:hover{border-color:rgba(255,255,255,.1)!important}
 
-    /* ── File info ── */
-    #tsun-file-info { display:none; margin-bottom:12px; }
-    #tsun-file-info.visible { display:block; animation: tsun-fadeSlideUp 0.2s both; }
-    #tsun-file-info-inner {
-      background: #14141e; border: 1px solid #242432;
-      border-radius: 8px; padding: 9px 11px;
-      font-size: 11px; color: #888; font-family: 'DM Mono', monospace;
-    }
-    #tsun-file-name {
-      color: #dddde8; font-weight: 500; font-size: 12px;
-      margin-bottom: 2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-    }
+/* ── Parse error ── */
+#tsun-perr{
+  display:none!important;background:rgba(255,60,60,.07)!important;
+  border:1px solid rgba(255,60,60,.22)!important;border-radius:9px!important;
+  padding:9px 12px!important;margin-bottom:10px!important;
+  font-size:11px!important;color:#ff9090!important;font-family:'DM Mono',monospace!important;
+}
+#tsun-perr.show{display:block!important;animation:t-up .22s both!important}
 
-    /* ── Parse error ── */
-    #tsun-parse-error {
-      display: none;
-      background: rgba(255,80,80,0.08);
-      border: 1px solid rgba(255,80,80,0.25);
-      border-radius: 8px;
-      padding: 9px 11px;
-      margin-bottom: 12px;
-      font-size: 11px; color: #ff8080;
-      font-family: 'DM Mono', monospace;
-    }
-    #tsun-parse-error.visible { display:block; animation: tsun-fadeSlideUp 0.2s both; }
+/* ── File info ── */
+#tsun-fi{display:none!important;margin-bottom:10px!important}
+#tsun-fi.show{display:block!important;animation:t-up .22s both!important}
+#tsun-fn{
+  color:#dddde8!important;font-weight:500!important;font-size:12px!important;
+  white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;
+  font-family:'DM Mono',monospace!important;display:block!important;margin-bottom:2px!important;
+}
+#tsun-fm{font-size:10px!important;color:#404055!important;font-family:'DM Mono',monospace!important}
 
-    /* ── Status filter ── */
-    #tsun-status-filter { display:none; margin-bottom:12px; }
-    #tsun-status-filter.visible { display:block; animation: tsun-fadeSlideUp 0.2s both; }
-    .tsun-section-label {
-      font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
-      color: #444; font-weight: 600; margin-bottom: 7px;
-    }
-    #tsun-status-checkboxes { display: flex; flex-wrap: wrap; gap: 5px; }
-    .tsun-status-cb {
-      display: flex; align-items: center; gap: 5px;
-      background: #14141e; border: 1px solid #242432;
-      border-radius: 6px; padding: 5px 9px;
-      cursor: pointer; font-size: 11px; color: #888;
-      transition: border-color 0.15s, background 0.15s, color 0.15s;
-      user-select: none;
-    }
-    .tsun-status-cb input { display:none; }
-    .tsun-status-cb.checked { border-color:#ff6b6b; background:rgba(255,107,107,0.07); color:#eee; }
-    .tsun-cb-dot { width:6px; height:6px; border-radius:50%; background:#333; flex-shrink:0; transition:background 0.15s; }
-    .tsun-status-cb.checked .tsun-cb-dot { background:#ff6b6b; }
-    .tsun-status-count { font-family:'DM Mono',monospace; font-size:10px; color:#444; margin-left:1px; }
-    .tsun-status-cb.checked .tsun-status-count { color:#ff6b6b; }
+.t-lbl{
+  font-size:9px!important;letter-spacing:.1em!important;text-transform:uppercase!important;
+  color:#333348!important;font-weight:700!important;margin-bottom:7px!important;display:block!important;
+}
 
-    /* ── Summary ── */
-    #tsun-summary { display:none; margin-bottom:12px; }
-    #tsun-summary.visible { display:block; animation: tsun-fadeSlideUp 0.2s both; }
-    #tsun-summary-inner {
-      background: #14141e; border: 1px solid #242432;
-      border-radius: 8px; padding: 9px 11px;
-    }
-    #tsun-summary-row {
-      display:flex; justify-content:space-between; align-items:center;
-      font-size:11px; color:#666; font-family:'DM Mono',monospace;
-    }
-    #tsun-summary-count { font-size:20px; font-weight:800; color:#e8e8ec; font-family:'Syne',sans-serif; }
+/* ── Status filter ── */
+#tsun-sf{display:none!important;margin-bottom:10px!important}
+#tsun-sf.show{display:block!important;animation:t-up .24s both!important}
+#tsun-sf-boxes{display:flex!important;flex-wrap:wrap!important;gap:5px!important}
+.t-scb{
+  display:flex!important;align-items:center!important;gap:5px!important;
+  background:rgba(255,255,255,.025)!important;border:1px solid rgba(255,255,255,.065)!important;
+  border-radius:6px!important;padding:5px 9px!important;cursor:pointer!important;
+  font-size:11px!important;color:#606080!important;
+  transition:border-color .18s,background .18s,color .18s,transform .12s!important;
+}
+.t-scb:hover{transform:translateY(-1px)!important}
+.t-scb input{display:none!important}
+.t-scb.on{border-color:rgba(255,107,107,.45)!important;background:rgba(255,107,107,.07)!important;color:#c8c8c8!important}
+.t-scb-dot{width:6px!important;height:6px!important;border-radius:50%!important;flex-shrink:0!important;transition:transform .15s!important}
+.t-scb.on .t-scb-dot{transform:scale(1.3)!important}
+.t-scb-cnt{font-family:'DM Mono',monospace!important;font-size:9px!important;color:#333348!important}
+.t-scb.on .t-scb-cnt{color:rgba(255,100,100,.7)!important}
 
-    /* ── Preview table ── */
-    #tsun-preview-section { display:none; margin-bottom:12px; }
-    #tsun-preview-section.visible { display:block; animation: tsun-fadeSlideUp 0.22s both; }
-    #tsun-preview-header {
-      display:flex; justify-content:space-between; align-items:center;
-      margin-bottom:7px;
-    }
-    #tsun-preview-toggle {
-      background:none; border:none; color:#555; cursor:pointer;
-      font-family:'DM Mono',monospace; font-size:10px; padding:0;
-      transition:color 0.15s;
-    }
-    #tsun-preview-toggle:hover { color:#aaa; }
-    #tsun-preview-viewport {
-      background: #0f0f16; border: 1px solid #1e1e2a;
-      border-radius: 8px; height: 176px; overflow-y: auto;
-      position: relative;
-    }
-    #tsun-preview-viewport::-webkit-scrollbar { width:3px; }
-    #tsun-preview-viewport::-webkit-scrollbar-thumb { background:#2a2a38; border-radius:2px; }
-    .tsun-preview-row {
-      display: flex; align-items: center;
-      padding: 0 10px; gap: 6px;
-      border-bottom: 1px solid rgba(255,255,255,0.03);
-      font-size: 10px; font-family:'DM Mono',monospace;
-    }
-    .tsun-preview-row:nth-child(even) { background: rgba(255,255,255,0.015); }
-    .tsun-preview-title { flex:1; color:#bbb; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .tsun-preview-status { color:#555; flex-shrink:0; font-size:9px; }
-    .tsun-preview-ch { color:#444; flex-shrink:0; font-size:9px; text-align:right; }
+/* ── Summary ── */
+#tsun-sum{display:none!important;margin-bottom:10px!important}
+#tsun-sum.show{display:block!important;animation:t-up .22s both!important}
+#tsun-sum-row{display:flex!important;justify-content:space-between!important;align-items:center!important;font-size:11px!important;color:#404058!important;font-family:'DM Mono',monospace!important;}
+#tsun-sum-n{font-size:24px!important;font-weight:800!important;color:#e4e4ec!important;font-family:'Syne',sans-serif!important;transition:transform .15s!important}
+#tsun-sum-n.bump{animation:t-pop .22s both!important}
 
-    /* ── Progress ── */
-    #tsun-progress-section { display:none; margin-bottom:12px; }
-    #tsun-progress-section.visible { display:block; animation: tsun-fadeSlideUp 0.22s both; }
+/* ── Preview ── */
+#tsun-pv{display:none!important;margin-bottom:10px!important}
+#tsun-pv.show{display:block!important;animation:t-up .24s both!important}
+#tsun-pv-hdr{display:flex!important;justify-content:space-between!important;align-items:center!important;margin-bottom:7px!important}
+#tsun-pv-tog{
+  background:none!important;border:none!important;color:#333348!important;cursor:pointer!important;
+  font-family:'DM Mono',monospace!important;font-size:9px!important;padding:2px 6px!important;
+  border-radius:4px!important;transition:color .15s,background .15s!important;letter-spacing:.04em!important;
+}
+#tsun-pv-tog:hover{color:#aaa!important;background:rgba(255,255,255,.04)!important}
+#tsun-pv-vp{
+  background:rgba(0,0,0,.22)!important;border:1px solid rgba(255,255,255,.055)!important;
+  border-radius:9px!important;height:160px!important;overflow-y:auto!important;position:relative!important;
+  transition:height .28s cubic-bezier(.4,0,.2,1)!important;
+}
+#tsun-pv-vp::-webkit-scrollbar{width:3px!important}
+#tsun-pv-vp::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08)!important;border-radius:2px!important}
+.t-pv-row{
+  display:flex!important;align-items:center!important;padding:0 10px!important;gap:6px!important;
+  border-bottom:1px solid rgba(255,255,255,.028)!important;
+  font-size:10px!important;font-family:'DM Mono',monospace!important;
+  transition:background .12s!important;
+}
+.t-pv-row:hover{background:rgba(255,255,255,.02)!important}
+.t-pv-t{flex:1!important;color:#777!important;overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important}
+.t-pv-s{color:#303048!important;flex-shrink:0!important;font-size:9px!important}
+.t-pv-c{color:#282840!important;flex-shrink:0!important;font-size:9px!important}
 
-    #tsun-phase-label {
-      font-size:10px; letter-spacing:0.08em; text-transform:uppercase;
-      font-weight:600; margin-bottom:6px; min-height:14px;
-      transition: color 0.3s;
-    }
-    #tsun-phase-label.phase-resolve { color: #de4dae; }
-    #tsun-phase-label.phase-import  { color: #ff6b6b; }
-    #tsun-phase-label.phase-ratelimit {
-      color: #ffd966;
-      animation: tsun-pulse 1s ease-in-out infinite;
-    }
+/* ── Progress ── */
+#tsun-prog{display:none!important;margin-bottom:10px!important}
+#tsun-prog.show{display:block!important;animation:t-up .24s both!important}
+#tsun-phase{
+  font-size:9px!important;letter-spacing:.1em!important;text-transform:uppercase!important;
+  font-weight:700!important;margin-bottom:8px!important;min-height:13px!important;
+  display:flex!important;align-items:center!important;gap:6px!important;
+}
+#tsun-phase::before{
+  content:''!important;width:5px!important;height:5px!important;border-radius:50%!important;
+  flex-shrink:0!important;transition:background .4s!important;background:currentColor!important;
+  opacity:.7!important;
+}
+#tsun-phase.ph-res{color:#de4dae!important}
+#tsun-phase.ph-imp{color:#ff6b6b!important}
+#tsun-phase.ph-ch {color:#4daede!important}
+#tsun-phase.ph-rl {color:#ffd966!important;animation:t-pulse .9s ease-in-out infinite!important}
+#tsun-bar-wrap{
+  background:rgba(255,255,255,.055)!important;border-radius:6px!important;height:5px!important;
+  overflow:hidden!important;margin-bottom:7px!important;position:relative!important;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.4)!important;
+}
+#tsun-bar{
+  height:100%!important;border-radius:6px!important;width:0%!important;
+  background:linear-gradient(90deg,#ff6b6b,#ff8c44)!important;
+  transition:width .38s cubic-bezier(.4,0,.2,1)!important;
+  position:relative!important;overflow:hidden!important;
+}
+#tsun-bar.ph-res-bar{background:linear-gradient(90deg,#de4dae,#9933cc)!important}
+#tsun-bar.ph-ch-bar {background:linear-gradient(90deg,#4daede,#2266cc)!important}
+#tsun-bar::after{
+  content:''!important;position:absolute!important;inset:0!important;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent)!important;
+  animation:t-shim 1.6s linear infinite!important;
+}
+#tsun-pr-row{display:flex!important;justify-content:space-between!important;font-family:'DM Mono',monospace!important;font-size:10px!important;color:#333350!important;}
+#tsun-cur-t{
+  font-size:10px!important;color:#404060!important;margin-top:5px!important;
+  white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;
+  font-family:'DM Mono',monospace!important;display:block!important;
+  animation:t-wipe .25s ease both!important;
+}
+#tsun-spd{font-size:9px!important;color:#252538!important;font-family:'DM Mono',monospace!important;margin-top:3px!important;transition:color .5s!important;display:block!important;min-height:13px!important}
+#tsun-spd.on{color:#4dde8e!important}
 
-    #tsun-progress-bar-wrap {
-      background: #181824; border-radius:4px; height:7px;
-      overflow:hidden; margin-bottom:6px; position:relative;
-    }
-    #tsun-progress-bar {
-      height:100%; border-radius:4px; width:0%;
-      background: linear-gradient(90deg, #ff6b6b, #ff9966);
-      transition: width 0.35s ease;
-      position: relative; overflow:hidden;
-    }
-    #tsun-progress-bar::after {
-      content:''; position:absolute; top:0; left:0; right:0; bottom:0;
-      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
-      animation: tsun-shimmer 1.6s linear infinite;
-    }
-    #tsun-progress-label {
-      display:flex; justify-content:space-between;
-      font-family:'DM Mono',monospace; font-size:10px; color:#444;
-    }
-    #tsun-current-title {
-      font-size:10px; color:#666; margin-top:5px;
-      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-      font-family:'DM Mono',monospace;
-    }
+/* ── Conf stats ── */
+#tsun-conf{display:none!important;margin-bottom:10px!important}
+#tsun-conf.show{display:block!important;animation:t-up .22s both!important}
+#tsun-conf .t-card{padding:8px 12px!important;margin-bottom:0!important}
+#tsun-panel .t-cr{display:flex!important;flex-direction:row!important;justify-content:space-between!important;align-items:center!important;padding:4px 0!important;gap:8px!important;font-family:'DM Mono',monospace!important;font-size:10px!important;color:#404060!important;}
+#tsun-panel .t-cr+.t-cr{border-top:1px solid rgba(255,255,255,.04)!important}
+#tsun-panel .t-cl{flex:1!important;white-space:nowrap!important}
+#tsun-panel .t-cv{font-weight:800!important;min-width:32px!important;text-align:right!important;flex-shrink:0!important;font-size:14px!important;font-family:'Syne',sans-serif!important;transition:transform .2s!important;}
+#tsun-panel .t-cv.bump{animation:t-num .2s both!important}
+.c-ex{color:#4dde8e!important}.c-fo{color:#4daede!important}.c-fa{color:#ff6b6b!important}
 
-    /* ── Confidence ── */
-    #tsun-confidence { display:none; margin-bottom:12px; }
-    #tsun-confidence.visible { display:block; animation: tsun-fadeSlideUp 0.2s both; }
-    #tsun-confidence-inner {
-      background:#14141e; border:1px solid #242432;
-      border-radius:8px; padding:8px 11px;
-      font-size:10px; font-family:'DM Mono',monospace;
-    }
-    .tsun-conf-row { display:flex; justify-content:space-between; padding:2px 0; color:#555; }
-    .tsun-conf-row span:last-child { font-weight:500; }
-    .tsun-conf-exact  { color:#4dde8e; }
-    .tsun-conf-alt    { color:#ffd966; }
-    .tsun-conf-fuzzy  { color:#ff9966; }
-    .tsun-conf-failed { color:#ff6b6b; }
+/* ── Done ── */
+#tsun-done{display:none!important;text-align:center!important;padding:10px 0 6px!important;margin-bottom:10px!important;position:relative!important}
+#tsun-done.show{display:block!important;animation:t-pop .36s cubic-bezier(.34,1.4,.64,1) both!important}
+#tsun-done-emoji{font-size:28px!important;display:block!important;margin-bottom:4px!important}
+#tsun-done-title{font-size:16px!important;font-weight:800!important;margin-bottom:4px!important}
+#tsun-done-sub{font-size:10px!important;color:#404060!important;font-family:'DM Mono',monospace!important;line-height:1.6!important}
 
-    /* ── Done ── */
-    #tsun-done { display:none; padding:8px 0 4px; }
-    #tsun-done.visible { display:block; animation: tsun-pop 0.3s both; }
-    #tsun-done-title { font-size:15px; font-weight:800; margin-bottom:3px; }
-    #tsun-done-sub { font-size:11px; color:#555; font-family:'DM Mono',monospace; }
+/* ── Confetti pieces ── */
+.t-cf{position:absolute!important;pointer-events:none!important;border-radius:50%!important;animation:t-confetti .8s ease-out both!important}
 
-    /* ── Failed entries list ── */
-    #tsun-failed-section { display:none; margin-top:10px; }
-    #tsun-failed-section.visible { display:block; animation: tsun-fadeSlideUp 0.22s both; }
-    #tsun-failed-section-header {
-      display:flex; justify-content:space-between; align-items:center;
-      margin-bottom:7px; cursor:pointer; user-select:none;
-    }
-    #tsun-failed-collapse {
-      background:none; border:none; color:#444; cursor:pointer;
-      font-size:13px; padding:0; transition:transform 0.2s, color 0.2s;
-    }
-    #tsun-failed-collapse:hover { color:#aaa; }
-    #tsun-failed-list {
-      max-height:200px; overflow-y:auto;
-      background:#0f0f16; border:1px solid #1e1e2a; border-radius:8px;
-    }
-    #tsun-failed-list::-webkit-scrollbar { width:3px; }
-    #tsun-failed-list::-webkit-scrollbar-thumb { background:#2a2a38; border-radius:2px; }
-    .tsun-failed-row {
-      display:flex; align-items:center; gap:8px;
-      padding:7px 10px; border-bottom:1px solid rgba(255,255,255,0.04);
-      transition:background 0.15s;
-      animation: tsun-rowIn 0.18s both;
-    }
-    .tsun-failed-row:last-child { border-bottom:none; }
-    .tsun-failed-row:hover { background:rgba(255,255,255,0.025); }
-    .tsun-failed-row.success { background: rgba(77,222,142,0.05); }
-    .tsun-failed-row.error   { background: rgba(255,107,107,0.05); }
-    .tsun-failed-info { flex:1; overflow:hidden; }
-    .tsun-failed-title {
-      font-size:11px; color:#bbb; white-space:nowrap;
-      overflow:hidden; text-overflow:ellipsis; font-family:'DM Mono',monospace;
-    }
-    .tsun-failed-reason { font-size:10px; color:#555; font-family:'DM Mono',monospace; }
-    .tsun-retry-single {
-      flex-shrink:0; background:none; border:1px solid #2a2a3a;
-      border-radius:5px; color:#888; cursor:pointer; padding:3px 7px;
-      font-size:10px; font-family:'Syne',sans-serif; font-weight:600;
-      transition:border-color 0.15s, color 0.15s, background 0.15s;
-    }
-    .tsun-retry-single:hover { border-color:#ff6b6b; color:#ff6b6b; background:rgba(255,107,107,0.06); }
-    .tsun-retry-single:disabled { opacity:0.3; cursor:not-allowed; }
-    .tsun-row-status { flex-shrink:0; font-size:13px; width:18px; text-align:center; }
-    .tsun-spin { display:inline-block; animation: tsun-spin 0.7s linear infinite; }
+/* ── Failed list ── */
+#tsun-fails{display:none!important;margin-bottom:10px!important}
+#tsun-fails.show{display:block!important;animation:t-up .24s both!important}
+#tsun-fails-hdr{display:flex!important;justify-content:space-between!important;align-items:center!important;margin-bottom:7px!important;cursor:pointer!important;}
+#tsun-fails-hdr:hover .t-lbl{color:#666!important}
+#tsun-fails-tog{background:none!important;border:none!important;color:#333350!important;cursor:pointer!important;font-size:13px!important;padding:2px 5px!important;border-radius:4px!important;transition:color .15s,background .15s!important;line-height:1!important;}
+#tsun-fails-tog:hover{color:#aaa!important;background:rgba(255,255,255,.04)!important}
+#tsun-fails-list{max-height:180px!important;overflow-y:auto!important;background:rgba(0,0,0,.2)!important;border:1px solid rgba(255,255,255,.055)!important;border-radius:9px!important;}
+#tsun-fails-list::-webkit-scrollbar{width:3px!important}
+#tsun-fails-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.09)!important;border-radius:2px!important}
+.t-fr{display:flex!important;align-items:center!important;gap:8px!important;padding:7px 11px!important;border-bottom:1px solid rgba(255,255,255,.035)!important;transition:background .15s!important;animation:t-row .22s both!important;}
+.t-fr:last-child{border-bottom:none!important}
+.t-fr:hover{background:rgba(255,255,255,.018)!important}
+.t-fr.ok{background:rgba(77,222,142,.04)!important}
+.t-fi{flex:1!important;overflow:hidden!important;min-width:0!important}
+.t-ft{font-size:11px!important;color:#aaa!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;font-family:'DM Mono',monospace!important;display:block!important}
+.t-frsn{font-size:9px!important;color:#2e2e46!important;font-family:'DM Mono',monospace!important;display:block!important;margin-top:1px!important}
+.t-r1{
+  flex-shrink:0!important;background:none!important;border:1px solid rgba(255,255,255,.07)!important;
+  border-radius:5px!important;color:#444!important;cursor:pointer!important;padding:3px 8px!important;
+  font-size:10px!important;font-family:'Syne',sans-serif!important;font-weight:700!important;
+  transition:border-color .15s,color .15s,background .15s,transform .1s!important;
+}
+.t-r1:hover{border-color:rgba(255,107,107,.4)!important;color:#ff8080!important;background:rgba(255,107,107,.06)!important;transform:scale(1.05)!important}
+.t-r1:disabled{opacity:.2!important;cursor:not-allowed!important}
+.t-fst{flex-shrink:0!important;font-size:13px!important;width:16px!important;text-align:center!important}
+.spin{display:inline-block!important;animation:t-spin .6s linear infinite!important}
 
-    /* ── Buttons ── */
-    #tsun-btn-primary { display:flex; gap:7px; margin-bottom:7px; }
-    #tsun-btn-secondary { display:flex; gap:7px; flex-wrap:wrap; }
+/* ── Keyboard shortcut hint ── */
+#tsun-kbhint{
+  font-size:9px!important;color:#262638!important;font-family:'DM Mono',monospace!important;
+  text-align:center!important;padding:4px 0 0!important;letter-spacing:.02em!important;
+  transition:color .3s!important;
+}
+#tsun-kbhint.lit{color:#3a3a55!important}
 
-    .tsun-btn {
-      flex:1; border:none; border-radius:8px; padding:9px 12px;
-      font-family:'Syne',sans-serif; font-size:11px; font-weight:700;
-      letter-spacing:0.04em; cursor:pointer;
-      transition:opacity 0.15s, transform 0.1s, background 0.15s;
-      white-space:nowrap;
-    }
-    .tsun-btn:active:not(:disabled) { transform:scale(0.96); }
-    .tsun-btn:disabled { opacity:0.25; cursor:not-allowed; }
+/* ── Toast ── */
+#tsun-toast{
+  position:absolute!important;bottom:72px!important;left:50%!important;transform:translateX(-50%)!important;
+  background:rgba(30,30,44,.95)!important;border:1px solid rgba(255,255,255,.1)!important;
+  border-radius:8px!important;padding:7px 14px!important;
+  font-size:11px!important;font-family:'DM Mono',monospace!important;color:#ccc!important;
+  white-space:nowrap!important;pointer-events:none!important;z-index:30!important;
+  opacity:0!important;
+}
+#tsun-toast.show{animation:t-toast 2.8s ease forwards!important}
+#tsun-toast.t-ok {border-color:rgba(77,222,142,.3)!important;color:#4dde8e!important}
+#tsun-toast.t-err{border-color:rgba(255,107,107,.3)!important;color:#ff8080!important}
 
-    #tsun-start-btn {
-      background:linear-gradient(135deg,#ff6b6b,#ff3333); color:#fff;
-      box-shadow: 0 2px 12px rgba(255,68,68,0.3);
-    }
-    #tsun-start-btn:hover:not(:disabled) { opacity:0.85; }
+/* ── Buttons ── */
+#tsun-btns{margin-top:auto!important;padding-top:8px!important;flex-shrink:0!important}
+#tsun-btn-p{display:flex!important;gap:7px!important;margin-bottom:6px!important}
+#tsun-btn-s{display:flex!important;gap:6px!important;flex-wrap:wrap!important}
+.tb{
+  flex:1!important;border:none!important;border-radius:8px!important;padding:9px 10px!important;
+  font-family:'Syne',sans-serif!important;font-size:11px!important;font-weight:700!important;
+  letter-spacing:.04em!important;cursor:pointer!important;white-space:nowrap!important;
+  position:relative!important;overflow:hidden!important;
+  transition:filter .15s,transform .12s,box-shadow .2s,opacity .15s!important;
+}
+.tb::after{content:''!important;position:absolute!important;inset:0!important;background:rgba(255,255,255,.1)!important;opacity:0!important;transition:opacity .15s!important;border-radius:8px!important;}
+.tb:hover:not(:disabled)::after{opacity:.4!important}
+.tb:active:not(:disabled){transform:scale(.95)!important}
+.tb:active:not(:disabled)::after{opacity:1!important}
+.tb:disabled{opacity:.18!important;cursor:not-allowed!important;transform:none!important}
+#tsun-start{background:linear-gradient(135deg,#ff5555,#ff2222)!important;color:#fff!important;box-shadow:0 2px 18px rgba(255,40,40,.38)!important;}
+#tsun-start:hover:not(:disabled){filter:brightness(1.12)!important;box-shadow:0 4px 26px rgba(255,40,40,.56)!important}
+#tsun-pause{display:none!important;background:rgba(255,255,255,.055)!important;border:1px solid rgba(255,255,255,.1)!important;color:#b0b0c8!important;}
+#tsun-pause.show{display:block!important;animation:t-up .18s both!important}
+#tsun-pause:hover:not(:disabled){background:rgba(255,255,255,.09)!important}
+#tsun-cancel{display:none!important;background:rgba(255,50,50,.06)!important;border:1px solid rgba(255,50,50,.17)!important;color:#bb6868!important;}
+#tsun-cancel.show{display:block!important;animation:t-up .18s both!important}
+#tsun-cancel:hover{background:rgba(255,50,50,.13)!important;color:#ff8888!important}
+#tsun-retry{display:none!important;background:rgba(77,222,142,.06)!important;border:1px solid rgba(77,222,142,.18)!important;color:#4dde8e!important}
+#tsun-retry.show{display:block!important}
+#tsun-retry:hover{background:rgba(77,222,142,.12)!important}
+#tsun-logdl{display:none!important;background:rgba(255,170,50,.06)!important;border:1px solid rgba(255,170,50,.18)!important;color:#c09040!important}
+#tsun-logdl.show{display:block!important}
+#tsun-logdl:hover{background:rgba(255,170,50,.12)!important}
+#tsun-expq{display:none!important;background:rgba(77,174,222,.06)!important;border:1px solid rgba(77,174,222,.18)!important;color:#4daede!important}
+#tsun-expq.show{display:block!important}
+#tsun-expq:hover{background:rgba(77,174,222,.12)!important}
 
-    #tsun-pause-btn { display:none; background:#16161f; border:1px solid #2e2e3e; color:#bbb; }
-    #tsun-pause-btn.visible { display:block; }
-    #tsun-pause-btn:hover:not(:disabled) { background:#1e1e2e; border-color:#3e3e50; }
-
-    #tsun-cancel-btn {
-      display:none; background:#1e1414; border:1px solid #3e2020; color:#cc7070; font-size:11px;
-    }
-    #tsun-cancel-btn.visible { display:block; }
-    #tsun-cancel-btn:hover { background:#281414; border-color:#552020; color:#ff8888; }
-
-    #tsun-retry-btn { display:none; background:#141e15; border:1px solid #2a4030; color:#4dde8e; }
-    #tsun-retry-btn.visible { display:block; }
-    #tsun-retry-btn:hover { background:#182018; }
-
-    #tsun-log-btn { display:none; background:#1e1a14; border:1px solid #3a3020; color:#cc9944; }
-    #tsun-log-btn.visible { display:block; }
-    #tsun-log-btn:hover { background:#241e14; }
-
-    #tsun-export-btn { display:none; background:#141a22; border:1px solid #2030408a; color:#4daede; }
-    #tsun-export-btn.visible { display:block; }
-    #tsun-export-btn:hover { background:#18202c; }
+/* ── Footer ── */
+#tsun-footer{
+  padding-top:8px!important;border-top:1px solid rgba(255,255,255,.045)!important;
+  margin-top:8px!important;flex-shrink:0!important;
+  display:flex!important;justify-content:space-between!important;align-items:center!important;
+}
+.t-flink{font-size:10px!important;color:#2a2a40!important;text-decoration:none!important;font-family:'DM Mono',monospace!important;transition:color .15s!important;}
+.t-flink:hover{color:#777!important}
+#tsun-ver{font-size:9px!important;color:#1e1e30!important;font-family:'DM Mono',monospace!important}
   `;
   document.head.appendChild(style);
 
-  /* ═══════════════════════════════════════════════════════════════
-     PANEL HTML
-  ═══════════════════════════════════════════════════════════════ */
+  /* ── Panel HTML ─────────────────────────────────────────────── */
   const panel = document.createElement('div');
   panel.id = 'tsun-panel';
   panel.innerHTML = `
     <div id="tsun-header">
       <div id="tsun-header-left">
-        <div id="tsun-logo">TI</div>
+        <span id="tsun-dot"></span>
         <span id="tsun-title">Tsun Importer</span>
         <span id="tsun-badge"></span>
       </div>
-      <button id="tsun-toggle-btn">−</button>
+      <div id="tsun-mini">
+        <span class="t-ms" id="t-ms-ex">—</span>
+        <span style="color:#1e1e30">·</span>
+        <span class="t-ms" id="t-ms-fo">—</span>
+        <span style="color:#1e1e30">·</span>
+        <span class="t-ms" id="t-ms-fa">—</span>
+      </div>
+      <div id="tsun-wc">
+        <button class="tsun-wc-btn" id="tsun-min-btn"   title="Minimise (M)"></button>
+        <button class="tsun-wc-btn" id="tsun-close-btn" title="Close"></button>
+      </div>
     </div>
 
     <div id="tsun-body">
-
       <div id="tsun-dropzone">
-        <div id="tsun-dropzone-icon">📂</div>
-        <div id="tsun-dropzone-text">
-          <strong>Drop your file here</strong><br>
+        <span id="tsun-dz-icon">📂</span>
+        <div id="tsun-dz-text">
+          <strong>Drop your file here</strong>
           Comick <code>.csv</code> · MU/Weebcentral <code>.txt</code> · MAL <code>.xml</code>
         </div>
+        <div id="tsun-dz-hint">or click to browse</div>
         <input type="file" id="tsun-file-input" accept=".csv,.txt,.xml">
       </div>
 
-      <div id="tsun-parse-error"></div>
+      <div id="tsun-perr"></div>
 
-      <div id="tsun-file-info">
-        <div id="tsun-file-info-inner">
-          <div id="tsun-file-name"></div>
-          <span id="tsun-file-meta"></span>
+      <div id="tsun-fi" class="t-card">
+        <span id="tsun-fn"></span>
+        <span id="tsun-fm"></span>
+      </div>
+
+      <div id="tsun-sf">
+        <span class="t-lbl">Import statuses</span>
+        <div id="tsun-sf-boxes"></div>
+      </div>
+
+      <div id="tsun-sum" class="t-card">
+        <div id="tsun-sum-row">
+          <span>Selected to import</span>
+          <span id="tsun-sum-n">—</span>
         </div>
       </div>
 
-      <div id="tsun-status-filter">
-        <div class="tsun-section-label">Import statuses</div>
-        <div id="tsun-status-checkboxes"></div>
+      <div id="tsun-pv">
+        <div id="tsun-pv-hdr">
+          <span class="t-lbl" style="margin-bottom:0">Preview</span>
+          <button id="tsun-pv-tog">Show ▾</button>
+        </div>
+        <div id="tsun-pv-vp" style="display:none"></div>
       </div>
 
-      <div id="tsun-summary">
-        <div id="tsun-summary-inner">
-          <div id="tsun-summary-row">
-            <span>Selected to import</span>
-            <span id="tsun-summary-count">—</span>
-          </div>
+      <div id="tsun-prog">
+        <div id="tsun-phase"></div>
+        <div id="tsun-bar-wrap"><div id="tsun-bar"></div></div>
+        <div id="tsun-pr-row">
+          <span id="tsun-pr-n">0 / 0</span>
+          <span id="tsun-skip-n"></span>
         </div>
+        <span id="tsun-cur-t"></span>
+        <span id="tsun-spd"></span>
       </div>
 
-      <div id="tsun-preview-section">
-        <div id="tsun-preview-header">
-          <div class="tsun-section-label" style="margin-bottom:0">Preview</div>
-          <button id="tsun-preview-toggle">Show ▾</button>
-        </div>
-        <div id="tsun-preview-viewport" style="display:none"></div>
-      </div>
-
-      <div id="tsun-progress-section">
-        <div id="tsun-phase-label"></div>
-        <div id="tsun-progress-bar-wrap">
-          <div id="tsun-progress-bar"></div>
-        </div>
-        <div id="tsun-progress-label">
-          <span id="tsun-progress-text">0 / 0</span>
-          <span id="tsun-skipped-text"></span>
-        </div>
-        <div id="tsun-current-title"></div>
-      </div>
-
-      <div id="tsun-confidence">
-        <div id="tsun-confidence-inner">
-          <div class="tsun-conf-row"><span>Exact match</span><span id="conf-exact" class="tsun-conf-exact">0</span></div>
-          <div class="tsun-conf-row"><span>Alt title match</span><span id="conf-alt" class="tsun-conf-alt">0</span></div>
-          <div class="tsun-conf-row"><span>Fuzzy match</span><span id="conf-fuzzy" class="tsun-conf-fuzzy">0</span></div>
-          <div class="tsun-conf-row"><span>Unresolved</span><span id="conf-failed" class="tsun-conf-failed">0</span></div>
+      <div id="tsun-conf">
+        <div class="t-card">
+          <div class="t-cr"><span class="t-cl">Tracker map</span><span class="t-cv c-ex" id="c-ex">0</span></div>
+          <div class="t-cr"><span class="t-cl">Title search</span><span class="t-cv c-fo" id="c-fo">0</span></div>
+          <div class="t-cr"><span class="t-cl">Not found</span>  <span class="t-cv c-fa" id="c-fa">0</span></div>
         </div>
       </div>
 
       <div id="tsun-done">
-        <div id="tsun-done-title">✓ Import Complete</div>
+        <span id="tsun-done-emoji"></span>
+        <div id="tsun-done-title"></div>
         <div id="tsun-done-sub"></div>
       </div>
 
-      <div id="tsun-failed-section">
-        <div id="tsun-failed-section-header">
-          <div class="tsun-section-label" style="margin-bottom:0">Failed entries</div>
-          <button id="tsun-failed-collapse">▾</button>
+      <div id="tsun-fails">
+        <div id="tsun-fails-hdr">
+          <span class="t-lbl" style="margin-bottom:0">Failed entries</span>
+          <button id="tsun-fails-tog">▾</button>
         </div>
-        <div id="tsun-failed-list"></div>
+        <div id="tsun-fails-list"></div>
       </div>
 
-      <div id="tsun-btn-primary">
-        <button class="tsun-btn" id="tsun-start-btn" disabled>Start Import</button>
-        <button class="tsun-btn" id="tsun-pause-btn">Pause</button>
-        <button class="tsun-btn" id="tsun-cancel-btn">✕ Cancel</button>
-      </div>
-      <div id="tsun-btn-secondary">
-        <button class="tsun-btn" id="tsun-retry-btn">↺ Retry All</button>
-        <button class="tsun-btn" id="tsun-log-btn">⬇ Error Log</button>
-        <button class="tsun-btn" id="tsun-export-btn">⬇ Export Queue</button>
+      <div id="tsun-btns">
+        <div id="tsun-btn-p">
+          <button class="tb" id="tsun-start" disabled>Start Import</button>
+          <button class="tb" id="tsun-pause">Pause</button>
+          <button class="tb" id="tsun-cancel">✕ Cancel</button>
+        </div>
+        <div id="tsun-btn-s">
+          <button class="tb" id="tsun-retry">↺ Retry All</button>
+          <button class="tb" id="tsun-logdl">⬇ Error Log</button>
+          <button class="tb" id="tsun-expq">⬇ Export</button>
+        </div>
       </div>
 
+      <div id="tsun-kbhint">Space · pause &nbsp;|&nbsp; Esc · cancel &nbsp;|&nbsp; M · minimise</div>
+
+      <div id="tsun-footer">
+        <a href="https://github.com/OnlyShresth/weebcentral-extractor" target="_blank" class="t-flink">Weebcentral Guide ↗</a>
+        <span id="tsun-ver">v3.0</span>
+      </div>
     </div>
+
+    <!-- resize handles -->
+    <div class="t-rz t-rz-se" data-dir="se"></div>
+    <div class="t-rz t-rz-e"  data-dir="e"></div>
+    <div class="t-rz t-rz-s"  data-dir="s"></div>
+    <div class="t-rz t-rz-w"  data-dir="w"></div>
+    <div class="t-rz t-rz-n"  data-dir="n"></div>
+    <div class="t-rz t-rz-ne" data-dir="ne"></div>
+    <div class="t-rz t-rz-sw" data-dir="sw"></div>
+    <div class="t-rz t-rz-nw" data-dir="nw"></div>
+
+    <div id="tsun-toast"></div>
   `;
   document.body.appendChild(panel);
 
-  /* ═══════════════════════════════════════════════════════════════
-     ELEMENT REFS
-  ═══════════════════════════════════════════════════════════════ */
-  const $  = id => document.getElementById(id);
-  const dropzone        = $('tsun-dropzone');
-  const fileInput       = $('tsun-file-input');
-  const parseError      = $('tsun-parse-error');
-  const fileInfo        = $('tsun-file-info');
-  const fileName        = $('tsun-file-name');
-  const fileMeta        = $('tsun-file-meta');
-  const badge           = $('tsun-badge');
-  const statusFilter    = $('tsun-status-filter');
-  const statusCbs       = $('tsun-status-checkboxes');
-  const summary         = $('tsun-summary');
-  const summaryCount    = $('tsun-summary-count');
-  const previewSection  = $('tsun-preview-section');
-  const previewViewport = $('tsun-preview-viewport');
-  const previewToggle   = $('tsun-preview-toggle');
-  const progressSection = $('tsun-progress-section');
-  const phaseLabel      = $('tsun-phase-label');
-  const progressBar     = $('tsun-progress-bar');
-  const progressText    = $('tsun-progress-text');
-  const skippedText     = $('tsun-skipped-text');
-  const currentTitle    = $('tsun-current-title');
-  const confidenceBox   = $('tsun-confidence');
-  const doneBox         = $('tsun-done');
-  const failedSection   = $('tsun-failed-section');
-  const failedList      = $('tsun-failed-list');
-  const startBtn        = $('tsun-start-btn');
-  const pauseBtn        = $('tsun-pause-btn');
-  const cancelBtn       = $('tsun-cancel-btn');
-  const retryBtn        = $('tsun-retry-btn');
-  const logBtn          = $('tsun-log-btn');
-  const exportBtn       = $('tsun-export-btn');
-  const confStats       = { exact: 0, alt: 0, fuzzy: 0, failed: 0 };
+  /* ── Set initial size via JS (so CSS can't fight us) ─────── */
+  panel.style.width  = '390px';
+  panel.style.height = 'auto';
 
-  /* ═══════════════════════════════════════════════════════════════
-     COLLAPSE TOGGLE
-  ═══════════════════════════════════════════════════════════════ */
-  let collapsed = false;
-  $('tsun-header').addEventListener('click', e => {
-    if (e.target === $('tsun-toggle-btn') || e.target.closest('#tsun-toggle-btn')) return;
-    toggleCollapse();
-  });
-  $('tsun-toggle-btn').addEventListener('click', e => { e.stopPropagation(); toggleCollapse(); });
-  function toggleCollapse() {
-    collapsed = !collapsed;
-    $('tsun-body').style.display = collapsed ? 'none' : 'block';
-    $('tsun-toggle-btn').textContent = collapsed ? '+' : '−';
+  /* ── Element refs ───────────────────────────────────────────── */
+  const $ = id => document.getElementById(id);
+  const dz=    $('tsun-dropzone'), fi=$('tsun-file-input');
+  const perr=  $('tsun-perr'),     fInfo=$('tsun-fi'), fn=$('tsun-fn'), fm=$('tsun-fm');
+  const badge= $('tsun-badge'),    dot=$('tsun-dot');
+  const sf=    $('tsun-sf'),       sfBoxes=$('tsun-sf-boxes');
+  const sumBox=$('tsun-sum'),      sumN=$('tsun-sum-n');
+  const pvSec= $('tsun-pv'),       pvVp=$('tsun-pv-vp'), pvTog=$('tsun-pv-tog');
+  const progSec=$('tsun-prog'),    phLbl=$('tsun-phase'), bar=$('tsun-bar');
+  const prN=   $('tsun-pr-n'),     skipN=$('tsun-skip-n'), curT=$('tsun-cur-t'), spdLbl=$('tsun-spd');
+  const confBox=$('tsun-conf');
+  const doneBox=$('tsun-done');
+  const failsSec=$('tsun-fails'),  failList=$('tsun-fails-list');
+  const startBtn=$('tsun-start'),  pauseBtn=$('tsun-pause'), cancelBtn=$('tsun-cancel');
+  const retryBtn=$('tsun-retry'),  logBtn=$('tsun-logdl'),   expBtn=$('tsun-expq');
+  const toast=  $('tsun-toast'),   kbhint=$('tsun-kbhint');
+  const miniBox=$('tsun-mini');
+  const cStats={exact:0,found:0,fail:0};
+
+  /* ── Toast helper ───────────────────────────────────────────── */
+  let toastTimer;
+  function showToast(msg,type=''){
+    clearTimeout(toastTimer);
+    toast.textContent=msg; toast.className='show '+(type?'t-'+type:'');
+    toastTimer=setTimeout(()=>toast.className='',3000);
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     DRAG & DROP
-  ═══════════════════════════════════════════════════════════════ */
-  dropzone.addEventListener('dragover',  e => { e.preventDefault(); if (!isRunning) dropzone.classList.add('drag-over'); });
-  dropzone.addEventListener('dragleave', ()  => dropzone.classList.remove('drag-over'));
-  dropzone.addEventListener('drop', e => {
+  /* ── Number count-up animation ──────────────────────────────── */
+  function animNum(el,to){
+    const from=parseInt(el.textContent)||0; if(from===to) return;
+    const dur=Math.min(600,Math.abs(to-from)*18); const start=performance.now();
+    function step(now){
+      const t=Math.min(1,(now-start)/dur); const v=Math.round(from+(to-from)*t);
+      el.textContent=v; el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump');
+      if(t<1) requestAnimationFrame(step); else el.textContent=to;
+    }
+    requestAnimationFrame(step);
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     DRAG
+     On first move, snapshot pixel size and switch to left/top
+     anchoring so CSS bottom/right don't fight us.
+  ═══════════════════════════════════════════════════════════ */
+  let dragOffX=0,dragOffY=0,dragging=false,dragAnchored=false;
+  $('tsun-header').addEventListener('mousedown',e=>{
+    if(e.target.classList.contains('tsun-wc-btn')) return;
+    dragging=true; dragAnchored=false;
+    const r=panel.getBoundingClientRect();
+    dragOffX=e.clientX-r.left; dragOffY=e.clientY-r.top;
+    panel.style.transition='none'; panel.classList.add('t-drag-active');
     e.preventDefault();
-    dropzone.classList.remove('drag-over');
-    const file = e.dataTransfer.files[0];
-    if (file) handleFileSelected(file);
   });
-  dropzone.addEventListener('click', () => { if (!isRunning) fileInput.click(); });
-  fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFileSelected(fileInput.files[0]); });
+  document.addEventListener('mousemove',e=>{
+    if(!dragging) return;
+    if(!dragAnchored){
+      dragAnchored=true;
+      const r=panel.getBoundingClientRect();
+      panel.style.width=r.width+'px'; panel.style.height=r.height+'px';
+      panel.style.right='auto'; panel.style.bottom='auto';
+    }
+    const x=Math.max(0,Math.min(e.clientX-dragOffX,window.innerWidth-panel.offsetWidth));
+    const y=Math.max(0,Math.min(e.clientY-dragOffY,window.innerHeight-panel.offsetHeight));
+    panel.style.left=x+'px'; panel.style.top=y+'px';
+  });
+  document.addEventListener('mouseup',()=>{
+    if(!dragging) return; dragging=false;
+    panel.style.transition=''; panel.classList.remove('t-drag-active');
+  });
 
-  /* ═══════════════════════════════════════════════════════════════
-     FILE HANDLING
-  ═══════════════════════════════════════════════════════════════ */
-  async function handleFileSelected(file) {
-    if (isRunning) return;
+  /* ═══════════════════════════════════════════════════════════
+     RESIZE — 8-directional via data-dir attribute
+     Anchors the opposite corner so the panel grows/shrinks
+     in the correct direction without jumping.
+  ═══════════════════════════════════════════════════════════ */
+  let rzActive=false,rzDir='',rzStartX=0,rzStartY=0;
+  let rzStartW=0,rzStartH=0,rzStartL=0,rzStartT=0;
+  const MIN_W=280, MIN_H=120, MAX_W=800;
+
+  document.querySelectorAll('.t-rz').forEach(h=>{
+    h.addEventListener('mousedown',e=>{
+      rzActive=true; rzDir=h.dataset.dir;
+      rzStartX=e.clientX; rzStartY=e.clientY;
+      const r=panel.getBoundingClientRect();
+      rzStartW=r.width; rzStartH=r.height; rzStartL=r.left; rzStartT=r.top;
+      // Anchor to opposite corner
+      panel.style.right='auto'; panel.style.bottom='auto';
+      panel.style.left=rzStartL+'px'; panel.style.top=rzStartT+'px';
+      panel.style.width=rzStartW+'px'; panel.style.height=rzStartH+'px';
+      panel.classList.add('t-resizing');
+      panel.style.transition='none';
+      e.preventDefault(); e.stopPropagation();
+    });
+  });
+
+  document.addEventListener('mousemove',e=>{
+    if(!rzActive) return;
+    const dx=e.clientX-rzStartX, dy=e.clientY-rzStartY;
+    let w=rzStartW,h=rzStartH,l=rzStartL,t=rzStartT;
+
+    if(rzDir.includes('e')) w=Math.max(MIN_W,Math.min(MAX_W,rzStartW+dx));
+    if(rzDir.includes('s')) h=Math.max(MIN_H,rzStartH+dy);
+    if(rzDir.includes('w')){ const nw=Math.max(MIN_W,Math.min(MAX_W,rzStartW-dx)); l=rzStartL+(rzStartW-nw); w=nw; }
+    if(rzDir.includes('n')){ const nh=Math.max(MIN_H,rzStartH-dy); t=rzStartT+(rzStartH-nh); h=nh; }
+
+    panel.style.width=w+'px'; panel.style.height=h+'px';
+    panel.style.left=l+'px'; panel.style.top=t+'px';
+    // Adjust body max-height
+    $('tsun-body').style.maxHeight=(h-46)+'px';
+  });
+  document.addEventListener('mouseup',()=>{
+    if(!rzActive) return; rzActive=false;
+    panel.classList.remove('t-resizing'); panel.style.transition='';
+  });
+
+  /* ── Window controls ────────────────────────────────────────── */
+  let collapsed=false;
+  $('tsun-min-btn').addEventListener('click',e=>{
+    e.stopPropagation(); collapsed=!collapsed;
+    $('tsun-body').style.display=collapsed?'none':'';
+    miniBox.classList.toggle('show', collapsed&&isRunning);
+  });
+  $('tsun-close-btn').addEventListener('click',e=>{
+    e.stopPropagation();
+    if(isRunning&&!confirm('Import running. Close anyway?')) return;
+    panel.remove();
+  });
+
+  /* ── Keyboard shortcuts ─────────────────────────────────────── */
+  document.addEventListener('keydown',e=>{
+    if(!panel.isConnected) return;
+    // Don't fire when user is typing in an input
+    if(['INPUT','TEXTAREA','SELECT'].includes(e.target.tagName)) return;
+    if(e.key===' '&&isRunning){e.preventDefault();pauseBtn.click();kbhint.classList.add('lit');setTimeout(()=>kbhint.classList.remove('lit'),400);}
+    if(e.key==='Escape'&&isPaused){cancelBtn.click();}
+    if((e.key==='m'||e.key==='M')&&!e.ctrlKey&&!e.metaKey){$('tsun-min-btn').click();}
+  });
+
+  /* ── Drop file ──────────────────────────────────────────────── */
+  dz.addEventListener('dragover', e=>{e.preventDefault();if(!isRunning)dz.classList.add('drag-over');});
+  dz.addEventListener('dragleave',()=>dz.classList.remove('drag-over'));
+  dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag-over');const f=e.dataTransfer.files[0];if(f)handleFile(f);});
+  dz.addEventListener('click',()=>{if(!isRunning)fi.click();});
+  fi.addEventListener('change',()=>{if(fi.files[0])handleFile(fi.files[0]);});
+
+  /* ── File handling ──────────────────────────────────────────── */
+  async function handleFile(file){
+    if(isRunning) return;
     resetUI();
-
-    const ext = file.name.split('.').pop().toLowerCase();
-    if (!['csv', 'txt', 'xml'].includes(ext)) {
-      showParseError('Unsupported file type. Please use .csv, .txt or .xml');
-      return;
-    }
-
-    currentFormat = ext;
-    // Normalise line endings (Windows CRLF fix)
-    const raw  = await file.text();
-    const text = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-
-    fileName.textContent = file.name;
-    const labels = { csv:'Comick CSV', txt:'MU / Weebcentral TXT', xml:'MyAnimeList XML' };
-    fileMeta.textContent = labels[ext];
-    badge.textContent = ext.toUpperCase();
-    badge.className = ext;
-    fileInfo.classList.add('visible');
-
-    try {
-      if (ext === 'csv')      pendingEntries = parseComickCSV(text);
-      else if (ext === 'txt') pendingEntries = parseMUTxt(text);
-      else                    pendingEntries = parseMALXML(text);
-    } catch (err) {
-      showParseError('Parse failed: ' + err.message);
-      return;
-    }
-
-    // Empty file validation
-    if (pendingEntries.length === 0) {
-      showParseError('No valid entries found in this file. Check the format and try again.');
-      startBtn.disabled = true;
-      return;
-    }
-
-    if (ext === 'xml') {
-      buildStatusFilter(pendingEntries);
-      statusFilter.classList.add('visible');
-    }
-
-    updateSummary();
-    buildPreviewTable(pendingEntries);
-    previewSection.classList.add('visible');
-    startBtn.disabled = false;
+    const ext=file.name.split('.').pop().toLowerCase();
+    if(!['csv','txt','xml'].includes(ext)){showToast('Unsupported file','err');showErr('Unsupported file. Use .csv, .txt or .xml');return;}
+    currentFormat=ext;
+    const text=(await file.text()).replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+    fn.textContent=file.name;
+    fm.textContent={csv:'Comick CSV',txt:'MU / Weebcentral TXT',xml:'MyAnimeList XML'}[ext];
+    badge.textContent=ext.toUpperCase(); badge.className=ext;
+    fInfo.classList.add('show');
+    try{ pendingEntries=ext==='csv'?parseCSV(text):ext==='txt'?parseTXT(text):parseXML(text); }
+    catch(er){showErr('Parse error: '+er.message);showToast('Parse failed','err');return;}
+    if(!pendingEntries.length){showErr('No valid entries found.');startBtn.disabled=true;return;}
+    if(ext==='xml'){buildSF(pendingEntries);sf.classList.add('show');}
+    updateSum(); buildPrev(pendingEntries); pvSec.classList.add('show');
+    startBtn.disabled=false;
+    showToast(`${pendingEntries.length} entries loaded`,'ok');
   }
+  function showErr(m){perr.textContent='⚠ '+m;perr.classList.add('show');}
 
-  function showParseError(msg) {
-    parseError.textContent = '⚠ ' + msg;
-    parseError.classList.add('visible');
+  /* ── Parsers ────────────────────────────────────────────────── */
+  function parseCSV(t){
+    const lines=t.split('\n').filter(l=>l.trim());
+    if(lines.length<2) return [];
+    const hdr=csvL(lines[0]).map(h=>h.toLowerCase());
+    const ti=hdr.findIndex(h=>h.includes('title')),ui=hdr.findIndex(h=>h.includes('url')||h.includes('link')),ci=hdr.findIndex(h=>h.includes('chapter'));
+    return lines.slice(1).map(l=>{const c=csvL(l);return{title:c[ti]||'',url:c[ui]||'',chapter:parseInt(c[ci])||0,source:'comick'};}).filter(e=>e.title||e.url);
   }
-
-  /* ═══════════════════════════════════════════════════════════════
-     PARSERS
-  ═══════════════════════════════════════════════════════════════ */
-  function parseComickCSV(text) {
-    const lines = text.split('\n').filter(l => l.trim());
-    if (lines.length < 2) return [];
-    const headers    = parseCSVLine(lines[0]).map(h => h.toLowerCase());
-    const titleIdx   = headers.findIndex(h => h.includes('title'));
-    const urlIdx     = headers.findIndex(h => h.includes('url') || h.includes('link'));
-    const chapterIdx = headers.findIndex(h => h.includes('chapter'));
-    return lines.slice(1).map(line => {
-      const cols = parseCSVLine(line);
-      return { title: cols[titleIdx] || '', url: cols[urlIdx] || '',
-               chapter: parseInt(cols[chapterIdx]) || 0, source: 'comick' };
-    }).filter(e => e.title || e.url);
-  }
-
-  function parseMUTxt(text) {
-    return text.split('\n')
-      .map(l => l.trim())
-      .filter(l => l.startsWith('https://www.mangaupdates.com'))
-      .map(url => ({ url, source: 'mu' }));
-  }
-
-  function parseMALXML(xmlText) {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(xmlText, 'application/xml');
-    if (doc.querySelector('parsererror')) throw new Error('Invalid XML file.');
-    const entries = [];
-    doc.querySelectorAll('manga').forEach(node => {
-      const g = tag => node.querySelector(tag)?.textContent?.trim() ?? '';
-      entries.push({
-        malId:        g('manga_mangadb_id'),
-        title:        g('manga_title'),
-        chaptersRead: parseInt(g('my_read_chapters'), 10) || 0,
-        status:       g('my_status'),
-        source:       'mal',
-      });
+  function parseTXT(t){ return t.split('\n').map(l=>l.trim()).filter(l=>l.startsWith('https://www.mangaupdates.com')).map(url=>({url,source:'mu'})); }
+  function parseXML(t){
+    const doc=new DOMParser().parseFromString(t,'application/xml');
+    if(doc.querySelector('parsererror')) throw new Error('Invalid XML');
+    const out=[];
+    doc.querySelectorAll('manga').forEach(n=>{
+      const g=tag=>n.querySelector(tag)?.textContent?.trim()??'';
+      out.push({malId:g('manga_mangadb_id'),title:g('manga_title'),chaptersRead:parseInt(g('my_read_chapters'),10)||0,status:g('my_status'),source:'mal'});
     });
-    return entries;
+    return out;
+  }
+  function csvL(line){
+    const r=[];let cur='',q=false;
+    for(let i=0;i<line.length;i++){const c=line[i];if(c==='"'){if(q&&line[i+1]==='"'){cur+='"';i++;}else q=!q;}else if(c===','&&!q){r.push(cur.trim());cur='';}else cur+=c;}
+    r.push(cur.trim());return r;
   }
 
-  // RFC-4180 CSV parser with "" escaped-quote support
-  function parseCSVLine(line) {
-    const result = [];
-    let cur = '', inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') {
-        if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; } // escaped quote
-        else { inQuotes = !inQuotes; }
-      } else if (ch === ',' && !inQuotes) { result.push(cur.trim()); cur = ''; }
-      else { cur += ch; }
-    }
-    result.push(cur.trim());
-    return result;
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     STATUS FILTER (MAL only)
-  ═══════════════════════════════════════════════════════════════ */
-  const STATUS_COLORS = {
-    'Reading':      '#4daede', 'Completed':    '#4dde8e',
-    'On-Hold':      '#ffd966', 'Dropped':      '#ff6b6b',
-    'Plan to Read': '#aaaacc',
-  };
-
-  function buildStatusFilter(entries) {
-    const counts = {};
-    entries.forEach(e => { const s = e.status || ''; if (s) counts[s] = (counts[s] || 0) + 1; });
-    statusCbs.innerHTML = '';
-    Object.entries(counts).sort((a, b) => b[1] - a[1]).forEach(([status, count]) => {
-      const label    = document.createElement('label');
-      label.className = 'tsun-status-cb checked';
-      const cb       = document.createElement('input');
-      cb.type        = 'checkbox'; cb.className = 'tsun-status-input';
-      cb.dataset.status = status; cb.checked = true;
-      const dot      = document.createElement('span');
-      dot.className  = 'tsun-cb-dot';
-      dot.style.background = STATUS_COLORS[status] || '#666';
-      const txt      = document.createTextNode(' ' + status + ' ');
-      const cntSpan  = document.createElement('span');
-      cntSpan.className = 'tsun-status-count'; cntSpan.textContent = count;
-      label.appendChild(cb); label.appendChild(dot);
-      label.appendChild(txt); label.appendChild(cntSpan);
-      cb.addEventListener('change', e => { label.classList.toggle('checked', e.target.checked); updateSummary(); });
-      statusCbs.appendChild(label);
+  /* ── Status filter ──────────────────────────────────────────── */
+  const SCOLORS={'Reading':'#4daede','Completed':'#4dde8e','On-Hold':'#ffd966','Dropped':'#ff6b6b','Plan to Read':'#aaaacc'};
+  function buildSF(entries){
+    const counts={};entries.forEach(e=>{if(e.status)counts[e.status]=(counts[e.status]||0)+1;});
+    sfBoxes.innerHTML='';
+    Object.entries(counts).sort((a,b)=>b[1]-a[1]).forEach(([st,cnt])=>{
+      const lbl=document.createElement('label');lbl.className='t-scb on';
+      const cb=document.createElement('input');cb.type='checkbox';cb.className='t-sci';cb.dataset.status=st;cb.checked=true;
+      const d=document.createElement('span');d.className='t-scb-dot';d.style.background=SCOLORS[st]||'#666';
+      const tx=document.createTextNode(' '+st+' ');
+      const cn=document.createElement('span');cn.className='t-scb-cnt';cn.textContent=cnt;
+      lbl.appendChild(cb);lbl.appendChild(d);lbl.appendChild(tx);lbl.appendChild(cn);
+      cb.addEventListener('change',ev=>{lbl.classList.toggle('on',ev.target.checked);updateSum();});
+      sfBoxes.appendChild(lbl);
     });
   }
-
-  function getSelectedStatuses() {
-    return [...statusCbs.querySelectorAll('.tsun-status-input:checked')].map(i => i.dataset.status);
+  function getSelSt(){return[...sfBoxes.querySelectorAll('.t-sci:checked')].map(i=>i.dataset.status);}
+  function getFiltered(){return currentFormat!=='xml'?pendingEntries:pendingEntries.filter(e=>getSelSt().includes(e.status));}
+  function updateSum(){
+    const n=getFiltered().length;
+    animNum(sumN,n); sumN.classList.remove('bump'); void sumN.offsetWidth; sumN.classList.add('bump');
+    sumBox.classList.add('show'); buildPrev(getFiltered());
   }
 
-  function getFilteredEntries() {
-    if (currentFormat !== 'xml') return pendingEntries;
-    const sel = getSelectedStatuses();
-    return pendingEntries.filter(e => sel.includes(e.status));
-  }
-
-  function updateSummary() {
-    summaryCount.textContent = getFilteredEntries().length.toLocaleString();
-    summary.classList.add('visible');
-    buildPreviewTable(getFilteredEntries());
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     PREVIEW TABLE (virtual scroller)
-  ═══════════════════════════════════════════════════════════════ */
-  let previewOpen = false;
-  const ROW_H = 22;
-
-  previewToggle.addEventListener('click', () => {
-    previewOpen = !previewOpen;
-    previewViewport.style.display = previewOpen ? 'block' : 'none';
-    previewToggle.textContent = previewOpen ? 'Hide ▴' : 'Show ▾';
-    if (previewOpen) renderPreviewRows();
+  /* ── Preview virtual scroll ─────────────────────────────────── */
+  let pvOpen=false,pvEntries=[];const RH=22;
+  pvTog.addEventListener('click',()=>{
+    pvOpen=!pvOpen;
+    pvVp.style.display=pvOpen?'block':'none';
+    pvTog.textContent=pvOpen?'Hide ▴':'Show ▾';
+    if(pvOpen)renderPv();
   });
-  previewViewport.addEventListener('scroll', renderPreviewRows, { passive: true });
-
-  let previewEntries = [];
-  function buildPreviewTable(entries) {
-    previewEntries = entries;
-    if (previewOpen) renderPreviewRows();
-  }
-
-  function renderPreviewRows() {
-    if (!previewOpen || !previewEntries.length) return;
-    const scrollTop = previewViewport.scrollTop;
-    const vpH       = previewViewport.clientHeight;
-    const start     = Math.max(0, Math.floor(scrollTop / ROW_H) - 2);
-    const end       = Math.min(previewEntries.length, Math.ceil((scrollTop + vpH) / ROW_H) + 3);
-    const totalH    = previewEntries.length * ROW_H;
-
-    // Ensure spacer div exists as first child
-    let spacer = previewViewport.querySelector('.tsun-preview-spacer');
-    if (!spacer) {
-      spacer = document.createElement('div');
-      spacer.className = 'tsun-preview-spacer';
-      spacer.style.cssText = 'position:relative;';
-      previewViewport.innerHTML = '';
-      previewViewport.appendChild(spacer);
-    }
-    spacer.style.height = totalH + 'px';
-
-    // Remove out-of-view rows
-    [...spacer.querySelectorAll('.tsun-preview-row')].forEach(el => {
-      const idx = parseInt(el.dataset.idx, 10);
-      if (idx < start || idx >= end) el.remove();
-    });
-
-    // Add missing rows
-    const existing = new Set([...spacer.querySelectorAll('.tsun-preview-row')].map(el => parseInt(el.dataset.idx, 10)));
-    for (let i = start; i < end; i++) {
-      if (existing.has(i)) continue;
-      const entry = previewEntries[i];
-      const row   = document.createElement('div');
-      row.className = 'tsun-preview-row';
-      row.dataset.idx = i;
-      row.style.cssText = `position:absolute;top:${i * ROW_H}px;left:0;right:0;height:${ROW_H}px;`;
-
-      const title = document.createElement('span'); title.className = 'tsun-preview-title';
-      title.textContent = entry.title || entry.url || '—';
-      const st    = document.createElement('span'); st.className = 'tsun-preview-status';
-      st.textContent = entry.status || entry.source || '';
-      const ch    = document.createElement('span'); ch.className = 'tsun-preview-ch';
-      ch.textContent = (entry.chaptersRead != null && entry.chaptersRead > 0) ? `ch.${entry.chaptersRead}` : '';
-
-      row.appendChild(title); row.appendChild(st); row.appendChild(ch);
-      spacer.appendChild(row);
+  pvVp.addEventListener('scroll',renderPv,{passive:true});
+  function buildPrev(e){pvEntries=e;if(pvOpen)renderPv();}
+  function renderPv(){
+    if(!pvOpen||!pvEntries.length)return;
+    const st=pvVp.scrollTop,vph=pvVp.clientHeight;
+    const s=Math.max(0,Math.floor(st/RH)-2),e=Math.min(pvEntries.length,Math.ceil((st+vph)/RH)+3);
+    let sp=pvVp.querySelector('.t-pvsp');
+    if(!sp){sp=document.createElement('div');sp.className='t-pvsp';sp.style.cssText='position:relative';pvVp.innerHTML='';pvVp.appendChild(sp);}
+    sp.style.height=(pvEntries.length*RH)+'px';
+    [...sp.querySelectorAll('.t-pv-row')].forEach(el=>{const i=parseInt(el.dataset.i,10);if(i<s||i>=e)el.remove();});
+    const ex=new Set([...sp.querySelectorAll('.t-pv-row')].map(el=>parseInt(el.dataset.i,10)));
+    for(let i=s;i<e;i++){
+      if(ex.has(i))continue;
+      const en=pvEntries[i];
+      const row=document.createElement('div');row.className='t-pv-row';row.dataset.i=i;
+      row.style.cssText=`position:absolute;top:${i*RH}px;left:0;right:0;height:${RH}px;`;
+      const tt=document.createElement('span');tt.className='t-pv-t';tt.textContent=en.title||en.url||'—';
+      const sv=document.createElement('span');sv.className='t-pv-s';sv.textContent=en.status||en.source||'';
+      const ch=document.createElement('span');ch.className='t-pv-c';ch.textContent=en.chaptersRead>0?`ch.${en.chaptersRead}`:'';
+      row.appendChild(tt);row.appendChild(sv);row.appendChild(ch);sp.appendChild(row);
     }
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     CACHE / RESUME HELPERS
-  ═══════════════════════════════════════════════════════════════ */
-  function loadMALCache() {
-    try { malResolutionCache = JSON.parse(localStorage.getItem(LS_MAL_CACHE_KEY) || '{}'); }
-    catch { malResolutionCache = {}; }
-  }
-  function saveMALCache() {
-    try { localStorage.setItem(LS_MAL_CACHE_KEY, JSON.stringify(malResolutionCache)); } catch {}
-  }
+  /* ── Resume ─────────────────────────────────────────────────── */
+  function saveResolved(r){try{localStorage.setItem(LS_RESOLVED_KEY,JSON.stringify(r));}catch{}}
+  function loadResolved(){try{const r=localStorage.getItem(LS_RESOLVED_KEY);return r?JSON.parse(r):null;}catch{return null;}}
+  function saveResume(x={}){try{localStorage.setItem(LS_RESUME_KEY,JSON.stringify({format:currentFormat,queue:importQueue,index:importIndex,...x}));}catch{}}
+  function loadResume(){try{const r=localStorage.getItem(LS_RESUME_KEY);return r?JSON.parse(r):null;}catch{return null;}}
+  function clearResume(){localStorage.removeItem(LS_RESUME_KEY);localStorage.removeItem(LS_RESOLVED_KEY);}
 
-  // Resolved array stored in a separate key to avoid overwriting it on every Phase 2 checkpoint
-  function saveResumeResolved(resolved) {
-    try { localStorage.setItem(LS_RESOLVED_KEY, JSON.stringify(resolved)); } catch {}
-  }
-  function loadResumeResolved() {
-    try { const r = localStorage.getItem(LS_RESOLVED_KEY); return r ? JSON.parse(r) : null; }
-    catch { return null; }
-  }
-
-  function saveResumeState(extra = {}) {
-    try {
-      localStorage.setItem(LS_RESUME_KEY, JSON.stringify({
-        format: currentFormat, queue: importQueue, index: importIndex, ...extra,
-      }));
-    } catch {}
-  }
-  function loadResumeState() {
-    try { const r = localStorage.getItem(LS_RESUME_KEY); return r ? JSON.parse(r) : null; }
-    catch { return null; }
-  }
-  function clearResumeState() {
-    localStorage.removeItem(LS_RESUME_KEY);
-    localStorage.removeItem(LS_RESOLVED_KEY);
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     TRACKER MAP (with 30-min staleness)
-  ═══════════════════════════════════════════════════════════════ */
-  async function getTrackerMap() {
-    const now = Date.now();
-    if (trackerMap && (now - trackerMapFetchedAt) < TRACKER_MAP_TTL_MS) return trackerMap;
-    try {
-      const res = await fetch(ATSU_TRACKER_MAP_URL);
-      const fresh = await res.json();
-      trackerMap = fresh;
-      trackerMapFetchedAt = now;
-      reverseTrackerMap = null; // invalidate reverse map on refresh
-    } catch {
-      if (!trackerMap) trackerMap = {}; // first-fetch failure: empty map
-      // On refresh failure: keep stale map, reset timer to avoid hammering
-      trackerMapFetchedAt = now;
-    }
-    return trackerMap;
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     NORMALISE TITLE
-  ═══════════════════════════════════════════════════════════════ */
-  function normaliseTitle(t) {
-    return t.toLowerCase()
-      .replace(/^(the|a|an)\s+/i, '')
-      .replace(/[^\w\s]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     MU RESOLVER  (with 429 rate-limit backoff)
-  ═══════════════════════════════════════════════════════════════ */
-  async function resolveMALEntry(entry) {
-    const { malId, title } = entry;
-
-    // 1. Memory cache
-    if (malResolutionCache[malId]) return malResolutionCache[malId];
-
-    // 2. Tracker map
-    const map = await getTrackerMap();
-    if (map[malId]) {
-      const result = { muUrl: map[malId], confidence: 'exact' };
-      malResolutionCache[malId] = result; saveMALCache();
-      return result;
-    }
-
-    // 3. MU API with rate-limit backoff loop
-    for (let attempt = 0; attempt <= MAX_MU_RETRIES; attempt++) {
-      let res;
-      try {
-        res = await fetch(MU_SEARCH_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ search: title, per_page: 5 }),
-        });
-      } catch {
-        // Network error — exponential backoff then retry
-        if (attempt === MAX_MU_RETRIES) return { muUrl: null, confidence: null };
-        await sleep(800 * (attempt + 1));
-        continue;
+  /* ── Tracker map ────────────────────────────────────────────── */
+  async function ensureTrackerMap(){
+    const now=Date.now();
+    if(trackerArr&&(now-trackerFetchedAt)<TRACKER_MAP_TTL_MS) return;
+    try{
+      const arr=await(await fetch(ATSU_TRACKER_MAP_URL)).json();
+      trackerArr=arr;trackerByMal={};trackerByMu={};
+      for(const item of arr){
+        if(item.idMal)          trackerByMal[String(item.idMal)]=item.id;
+        if(item.idMangaUpdates) trackerByMu[item.idMangaUpdates]=item.id;
       }
-
-      // 429 Rate limited
-      if (res.status === 429) {
-        if (attempt === MAX_MU_RETRIES) return { muUrl: null, confidence: null };
-        const retryAfterSec = Math.min(parseInt(res.headers.get('Retry-After') || '10', 10), 60);
-        // Countdown in the phase label
-        for (let s = retryAfterSec; s > 0; s--) {
-          phaseLabel.textContent = `Rate limited — resuming in ${s}s…`;
-          phaseLabel.className   = 'phase-ratelimit';
-          await sleep(1000);
-          // Honour pause/cancel even during wait
-          while (isPaused && !isCancelled) await sleep(300);
-          if (isCancelled) return { muUrl: null, confidence: null };
-        }
-        phaseLabel.textContent = 'Phase 1 — Resolving via MangaUpdates API';
-        phaseLabel.className   = 'phase-resolve';
-        continue; // retry
-      }
-
-      if (!res.ok) return { muUrl: null, confidence: null };
-
-      const data    = await res.json();
-      const results = data.results ?? [];
-      if (!results.length) return { muUrl: null, confidence: null };
-
-      const normTarget = normaliseTitle(title);
-
-      // Exact title match
-      for (const r of results) {
-        if (normaliseTitle(r.record?.title ?? '') === normTarget) {
-          const result = { muUrl: `https://www.mangaupdates.com/series/${r.record.series_id}`, confidence: 'exact' };
-          malResolutionCache[malId] = result; saveMALCache();
-          return result;
-        }
-      }
-      // Alt title match
-      for (const r of results) {
-        for (const assoc of (r.record?.associated ?? [])) {
-          if (normaliseTitle(assoc.title ?? '') === normTarget) {
-            const result = { muUrl: `https://www.mangaupdates.com/series/${r.record.series_id}`, confidence: 'alt' };
-            malResolutionCache[malId] = result; saveMALCache();
-            return result;
-          }
-        }
-      }
-      // Fuzzy fallback
-      const shortTarget = normTarget.split(' ').slice(0, 4).join(' ');
-      const topNorm     = normaliseTitle(results[0].record?.title ?? '');
-      if (shortTarget.length > 8 && topNorm.startsWith(shortTarget)) {
-        const result = { muUrl: `https://www.mangaupdates.com/series/${results[0].record.series_id}`, confidence: 'fuzzy' };
-        malResolutionCache[malId] = result; saveMALCache();
-        return result;
-      }
-
-      return { muUrl: null, confidence: null }; // no match found — don't retry
-    }
-
-    return { muUrl: null, confidence: null };
+      trackerFetchedAt=now;
+    }catch{if(!trackerArr){trackerArr=[];trackerByMal={};trackerByMu={};}trackerFetchedAt=now;}
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     ATSU BOOKMARK API
-  ═══════════════════════════════════════════════════════════════ */
-  async function getAtsuSeriesId(muUrl) {
-    const map = await getTrackerMap();
-    if (!reverseTrackerMap) {
-      reverseTrackerMap = Object.fromEntries(Object.entries(map).map(([id, url]) => [url, id]));
-    }
-    if (reverseTrackerMap[muUrl]) return reverseTrackerMap[muUrl];
-    try {
-      const res  = await fetch(`${ATSU_SEARCH_URL}?q=${encodeURIComponent(muUrl)}`);
-      const data = await res.json();
-      return data?.results?.[0]?.id ?? null;
-    } catch { return null; }
+  /* ── Atsu search ────────────────────────────────────────────── */
+  async function searchAtsu(query){
+    if(!query) return null;
+    try{
+      const params=new URLSearchParams({q:query,limit:5,query_by:'title,englishTitle',include_fields:'id,title'});
+      const res=await fetch(ATSU_SEARCH_PATH+'?'+params);
+      if(!res.ok) return null;
+      return (await res.json()).hits?.[0]?.document??null;
+    }catch{return null;}
   }
 
-  async function bookmarkOnAtsu(seriesId, chaptersRead) {
-    try {
-      const res = await fetch(ATSU_BOOKMARK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ seriesId, progress: chaptersRead }),
+  /* ── Resolve entry ──────────────────────────────────────────── */
+  async function resolveEntry(entry){
+    if(entry.source==='mal'){
+      if(entry.malId&&trackerByMal[String(entry.malId)]) return{atsuId:trackerByMal[String(entry.malId)],confidence:'exact'};
+      if(entry.title){const hit=await searchAtsu(entry.title);if(hit)return{atsuId:hit.id,confidence:'found'};}
+      return{atsuId:null,confidence:null};
+    }
+    if(entry.source==='mu'){
+      const muId=entry.url.match(/\/series\/([a-z0-9]+)/i)?.[1];
+      if(muId&&trackerByMu[muId]) return{atsuId:trackerByMu[muId],confidence:'exact'};
+      const slug=entry.url.match(/\/series\/[a-z0-9]+\/([^/]+)/i)?.[1];
+      if(slug){const hit=await searchAtsu(slug.replace(/-/g,' '));if(hit)return{atsuId:hit.id,confidence:'found'};}
+      return{atsuId:null,confidence:null};
+    }
+    if(entry.source==='comick'){
+      const muId=entry.url.match(/mangaupdates\.com\/series\/([a-z0-9]+)/i)?.[1];
+      if(muId&&trackerByMu[muId]) return{atsuId:trackerByMu[muId],confidence:'exact'};
+      if(entry.title){const hit=await searchAtsu(entry.title);if(hit)return{atsuId:hit.id,confidence:'found'};}
+      return{atsuId:null,confidence:null};
+    }
+    return{atsuId:null,confidence:null};
+  }
+
+  /* ── Bookmark / chapter ─────────────────────────────────────── */
+  async function postBookmarks(chunk){
+    for(let a=0;a<3;a++){
+      try{
+        const res=await fetch(ATSU_BOOKMARKS_PATH,{method:'POST',headers:{'content-type':'application/json'},credentials:'include',body:JSON.stringify(chunk)});
+        if(res.status===429){await sleep(2500);continue;}
+        if(res.ok) return true;
+      }catch{}
+      await sleep(800);
+    }
+    return false;
+  }
+  async function syncChapter(atsuId,chapterNum){
+    try{
+      const res=await fetch(ATSU_CHAPTERS_PATH+'?mangaId='+atsuId,{credentials:'include'});
+      if(!res.ok) return false;
+      const target=((await res.json()).chapters||[]).find(c=>Number(c.number)===Number(chapterNum));
+      if(!target) return false;
+      const payload={progress:[{mangaScanlationId:target.scanlationMangaId,mangaId:atsuId,chapterId:target.id,page:Math.max(0,(Number(target.pageCount)||1)-1),frac:1,pages:Number(target.pageCount)||1,ts:Date.now(),strip:false}],deletedChapters:[]};
+      return (await fetch(ATSU_PROGRESS_PATH,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)})).ok;
+    }catch{return false;}
+  }
+
+  /* ── Single retry ───────────────────────────────────────────── */
+  async function retrySingle(entry){
+    await ensureTrackerMap();
+    const{atsuId}=await resolveEntry(entry);
+    if(!atsuId)return{success:false,reason:'Still no match'};
+    const ok=await postBookmarks([{mangaId:atsuId,status:STATUS_MAP[entry.status]||'PlanToRead',synced:false,ts:Date.now(),type:'Manga'}]);
+    if(!ok)return{success:false,reason:'Bookmark POST failed'};
+    if(entry.chaptersRead>0)await syncChapter(atsuId,entry.chaptersRead);
+    return{success:true};
+  }
+
+  /* ── Failed list ────────────────────────────────────────────── */
+  let failsOpen=true;
+  $('tsun-fails-hdr').addEventListener('click',()=>{failsOpen=!failsOpen;failList.style.display=failsOpen?'block':'none';$('tsun-fails-tog').textContent=failsOpen?'▾':'▸';});
+  function buildFails(){
+    failList.innerHTML='';
+    failedEntries.forEach((en,idx)=>{
+      const row=document.createElement('div');row.className='t-fr';row.style.animationDelay=Math.min(idx*.028,.35)+'s';
+      const st=document.createElement('span');st.className='t-fst';st.textContent='✗';st.style.color='#ff6b6b';
+      const inf=document.createElement('div');inf.className='t-fi';
+      const tl=document.createElement('div');tl.className='t-ft';tl.textContent=en.title||en.url||en.malId||'—';
+      const re=document.createElement('div');re.className='t-frsn';re.textContent=en.reason||'Unknown';
+      inf.appendChild(tl);inf.appendChild(re);
+      const rb=document.createElement('button');rb.className='t-r1';rb.textContent='↺';
+      rb.addEventListener('click',async()=>{
+        rb.disabled=true;st.innerHTML='<span class="spin">⟳</span>';
+        const r=await retrySingle(en);
+        if(r.success){st.textContent='✓';st.style.color='#4dde8e';row.classList.add('ok');re.textContent='Imported';rb.style.display='none';failedEntries.splice(failedEntries.indexOf(en),1);}
+        else{st.textContent='✗';st.style.color='#ff6b6b';re.textContent=r.reason;rb.disabled=false;}
       });
-      return res.ok;
-    } catch { return false; }
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     SINGLE-ENTRY RETRY
-  ═══════════════════════════════════════════════════════════════ */
-  async function retrySingleEntry(entry) {
-    let muUrl = entry.muUrl || null;
-
-    if (!muUrl) {
-      if (currentFormat === 'xml') {
-        // Clear cache so resolver gets a fresh attempt
-        if (entry.malId) delete malResolutionCache[entry.malId];
-        const { muUrl: resolved } = await resolveMALEntry(entry);
-        muUrl = resolved;
-      } else if (currentFormat === 'csv') {
-        const map = await getTrackerMap();
-        muUrl = map[entry.url] || await searchAtsuForComick(entry);
-      }
-      if (!muUrl) return { success: false, reason: 'Still no match found' };
-    }
-
-    const seriesId = await getAtsuSeriesId(muUrl);
-    if (!seriesId) return { success: false, reason: 'Series not found on Atsu' };
-    const ok = await bookmarkOnAtsu(seriesId, entry.chaptersRead || entry.chapter || 0);
-    return ok ? { success: true } : { success: false, reason: 'Bookmark API error' };
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     FAILED ENTRIES LIST  (per-entry retry UI)
-  ═══════════════════════════════════════════════════════════════ */
-  let failedListOpen = true;
-
-  $('tsun-failed-section-header').addEventListener('click', () => {
-    failedListOpen = !failedListOpen;
-    failedList.style.display = failedListOpen ? 'block' : 'none';
-    $('tsun-failed-collapse').textContent = failedListOpen ? '▾' : '▸';
-  });
-
-  function buildFailedList() {
-    failedList.innerHTML = '';
-    if (!failedEntries.length) return;
-
-    failedEntries.forEach((entry, idx) => {
-      const row      = document.createElement('div');
-      row.className  = 'tsun-failed-row';
-      row.style.animationDelay = Math.min(idx * 0.03, 0.3) + 's';
-
-      const statusEl = document.createElement('span');
-      statusEl.className = 'tsun-row-status';
-      statusEl.textContent = '✗';
-      statusEl.style.color = '#ff6b6b';
-
-      const info     = document.createElement('div'); info.className = 'tsun-failed-info';
-      const titleEl  = document.createElement('div'); titleEl.className = 'tsun-failed-title';
-      titleEl.textContent = entry.title || entry.url || entry.malId || '—';
-      const reasonEl = document.createElement('div'); reasonEl.className = 'tsun-failed-reason';
-      reasonEl.textContent = entry.reason || 'Unknown error';
-      info.appendChild(titleEl); info.appendChild(reasonEl);
-
-      const retryOneBtn = document.createElement('button');
-      retryOneBtn.className = 'tsun-retry-single';
-      retryOneBtn.textContent = '↺';
-      retryOneBtn.title = 'Retry this entry';
-      retryOneBtn.addEventListener('click', async () => {
-        retryOneBtn.disabled = true;
-        statusEl.innerHTML = '<span class="tsun-spin">⟳</span>';
-        const result = await retrySingleEntry(entry);
-        if (result.success) {
-          statusEl.textContent = '✓'; statusEl.style.color = '#4dde8e';
-          row.classList.add('success');
-          reasonEl.textContent = 'Imported successfully';
-          retryOneBtn.style.display = 'none';
-          // Remove from failedEntries
-          const i = failedEntries.indexOf(entry);
-          if (i !== -1) failedEntries.splice(i, 1);
-        } else {
-          statusEl.textContent = '✗'; statusEl.style.color = '#ff6b6b';
-          row.classList.add('error');
-          reasonEl.textContent = result.reason;
-          retryOneBtn.disabled = false;
-        }
-      });
-
-      row.appendChild(statusEl); row.appendChild(info); row.appendChild(retryOneBtn);
-      failedList.appendChild(row);
+      row.appendChild(st);row.appendChild(inf);row.appendChild(rb);failList.appendChild(row);
     });
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     EXPORT QUEUE
-  ═══════════════════════════════════════════════════════════════ */
-  function getExportableUrls() {
-    // Resolved Phase 2 entries not yet imported (remaining in queue) + failed entries with muUrl
-    const fromRemaining = currentPhase2Resolved.slice(importIndex).map(e => e.muUrl).filter(Boolean);
-    const fromFailed    = failedEntries.filter(e => e.muUrl).map(e => e.muUrl);
-    return [...new Set([...fromRemaining, ...fromFailed])];
-  }
-
-  function triggerExport() {
-    const urls = getExportableUrls();
-    if (!urls.length) { alert('No resolved MU URLs to export.'); return; }
-    const blob = new Blob([urls.join('\n')], { type: 'text/plain' });
-    const a    = document.createElement('a');
-    a.href     = URL.createObjectURL(blob);
-    a.download = 'tsun_remaining_queue.txt';
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
-  exportBtn.addEventListener('click', triggerExport);
-
-  /* ═══════════════════════════════════════════════════════════════
-     CONFIDENCE COUNTER
-  ═══════════════════════════════════════════════════════════════ */
-  function updateConfidence() {
-    $('conf-exact').textContent  = confStats.exact;
-    $('conf-alt').textContent    = confStats.alt;
-    $('conf-fuzzy').textContent  = confStats.fuzzy;
-    $('conf-failed').textContent = confStats.failed;
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     UI HELPERS
-  ═══════════════════════════════════════════════════════════════ */
-  function setProgress(current, total, title = '') {
-    const pct = total > 0 ? Math.round((current / total) * 100) : 0;
-    progressBar.style.width = pct + '%';
-    progressText.textContent = `${current} / ${total}`;
-    currentTitle.textContent = title;
-  }
-
-  function setPhase(phase, label) {
-    phaseLabel.textContent = label;
-    phaseLabel.className   = 'phase-' + phase;
-  }
-
-  function resetUI() {
-    currentFormat = null; pendingEntries = []; importQueue = [];
-    importIndex = 0; isPaused = false; isRunning = false; isCancelled = false;
-    failedEntries = []; currentPhase2Resolved = [];
-    confStats.exact = confStats.alt = confStats.fuzzy = confStats.failed = 0;
-    previewEntries = []; previewOpen = false;
-
-    [fileInfo, statusFilter, summary, previewSection, progressSection,
-     confidenceBox, doneBox, failedSection].forEach(el => el.classList.remove('visible'));
-    [pauseBtn, cancelBtn, retryBtn, logBtn, exportBtn].forEach(el => el.classList.remove('visible'));
-    parseError.classList.remove('visible');
-    badge.className = '';
-    startBtn.disabled = false;
-    startBtn.textContent = 'Start Import';
-    pauseBtn.textContent = 'Pause';
-    statusCbs.innerHTML = '';
-    previewViewport.innerHTML = '';
-    previewViewport.style.display = 'none';
-    previewToggle.textContent = 'Show ▾';
-    failedList.innerHTML = '';
-    skippedText.textContent = '';
-    updateConfidence();
-    dropzone.classList.remove('running-lock');
-  }
-
-  function showDone(imported, skipped) {
-    doneBox.classList.add('visible');
-    $('tsun-done-sub').textContent =
-      `${imported} imported · ${skipped} skipped · ${failedEntries.length} failed`;
-    progressSection.classList.remove('visible');
-    pauseBtn.classList.remove('visible');
-    cancelBtn.classList.remove('visible');
-    startBtn.disabled = true;
-    dropzone.classList.remove('running-lock');
-
-    if (failedEntries.length) {
-      buildFailedList();
-      failedSection.classList.add('visible');
-      retryBtn.classList.add('visible');
-      logBtn.classList.add('visible');
+  /* ── Confetti burst ─────────────────────────────────────────── */
+  function confetti(){
+    const colors=['#4dde8e','#ffd966','#ff6b6b','#4daede','#de4dae','#ff9944'];
+    for(let i=0;i<14;i++){
+      const el=document.createElement('div');el.className='t-cf';
+      const sz=4+Math.random()*5;
+      el.style.cssText=`width:${sz}px;height:${sz}px;background:${colors[i%colors.length]};
+        left:${20+Math.random()*60}%;top:${30+Math.random()*30}%;
+        animation-delay:${Math.random()*.4}s;animation-duration:${.7+Math.random()*.5}s`;
+      doneBox.appendChild(el);
+      setTimeout(()=>el.remove(),1400);
     }
-    const exportUrls = getExportableUrls();
-    if (exportUrls.length) exportBtn.classList.add('visible');
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     BEFORE-UNLOAD GUARD
-  ═══════════════════════════════════════════════════════════════ */
-  window.addEventListener('beforeunload', e => {
-    if (isRunning) { e.preventDefault(); e.returnValue = ''; }
+  /* ── Export ─────────────────────────────────────────────────── */
+  expBtn.addEventListener('click',()=>{
+    const urls=failedEntries.filter(e=>e.url).map(e=>e.url);
+    if(!urls.length){showToast('Nothing to export','err');return;}
+    const el=Object.assign(document.createElement('a'),{href:URL.createObjectURL(new Blob([urls.join('\n')],{type:'text/plain'})),download:'tsun_failed.txt'});
+    el.click();URL.revokeObjectURL(el.href);showToast('Exported '+urls.length+' entries','ok');
   });
 
-  /* ═══════════════════════════════════════════════════════════════
-     START BUTTON
-  ═══════════════════════════════════════════════════════════════ */
-  startBtn.addEventListener('click', async () => {
-    if (isRunning) return;
+  /* ── Conf stats ─────────────────────────────────────────────── */
+  function updConf(){
+    animNum($('c-ex'),cStats.exact);
+    animNum($('c-fo'),cStats.found);
+    animNum($('c-fa'),cStats.fail);
+    // Mini header stats
+    $('t-ms-ex').textContent=cStats.exact||'—'; $('t-ms-ex').classList.toggle('lit',cStats.exact>0);
+    $('t-ms-fo').textContent=cStats.found||'—'; $('t-ms-fo').classList.toggle('lit',cStats.found>0);
+    $('t-ms-fa').textContent=cStats.fail||'—';
+  }
 
-    const resume = loadResumeState();
-    let resumeIntoPhase2 = false;
-    let resumedResolved  = null;
+  /* ── Speed / ETA ────────────────────────────────────────────── */
+  let p1Start=0;
+  function updSpd(done,total){
+    const el=(Date.now()-p1Start)/1000;if(el<0.5||done<2)return;
+    const rate=done/el,rem=total-done,eta=rem/Math.max(rate,.001);
+    const etaStr=eta<60?Math.ceil(eta)+'s':eta<3600?Math.floor(eta/60)+'m '+Math.ceil(eta%60)+'s':(eta/3600).toFixed(1)+'h';
+    spdLbl.textContent=`${rate.toFixed(1)}/s · ETA ${etaStr}`;spdLbl.className='on';
+  }
 
-    if (resume && resume.format === currentFormat) {
-      const savedResolved = loadResumeResolved();
-      const remaining = resume.phase === 2
-        ? (savedResolved?.length ?? 0) - resume.index
-        : (resume.queue?.length ?? 0) - resume.index;
-      const ok = confirm(`Resume previous import? (${remaining} entries left)`);
-      if (ok) {
-        importQueue = resume.queue;
-        importIndex = resume.index;
-        if (currentFormat === 'xml' && resume.phase === 2 && savedResolved) {
-          resumeIntoPhase2 = true;
-          resumedResolved  = savedResolved;
+  /* ── Progress helpers ───────────────────────────────────────── */
+  function setProgress(cur,tot,title=''){
+    const pct=tot>0?Math.round((cur/tot)*100):0;
+    bar.style.width=pct+'%'; prN.textContent=`${cur} / ${tot}`; curT.textContent=title;
+  }
+  function setPhase(cls,lbl,barCls=''){
+    phLbl.textContent=lbl; phLbl.className=cls;
+    bar.className=barCls;
+  }
+  function setDot(s){dot.className=s||'';}
+  function updMini(){if(collapsed)miniBox.classList.toggle('show',isRunning);}
+
+  /* ── Reset ──────────────────────────────────────────────────── */
+  function resetUI(){
+    currentFormat=null;pendingEntries=[];importQueue=[];importIndex=0;
+    isPaused=false;isRunning=false;isCancelled=false;failedEntries=[];
+    pvEntries=[];pvOpen=false;cStats.exact=cStats.found=cStats.fail=0;
+    [fInfo,sf,sumBox,pvSec,progSec,confBox,doneBox,failsSec].forEach(el=>el.classList.remove('show'));
+    [pauseBtn,cancelBtn,retryBtn,logBtn,expBtn].forEach(el=>el.classList.remove('show'));
+    perr.classList.remove('show');badge.className='';
+    startBtn.disabled=false;startBtn.textContent='Start Import';pauseBtn.textContent='Pause';
+    sfBoxes.innerHTML='';pvVp.innerHTML='';pvVp.style.display='none';
+    pvTog.textContent='Show ▾';failList.innerHTML='';
+    skipN.textContent='';spdLbl.textContent='';spdLbl.className='';
+    updConf();dz.classList.remove('locked');setDot('');miniBox.classList.remove('show');
+    $('tsun-body').style.maxHeight='';
+  }
+
+  /* ── Done ───────────────────────────────────────────────────── */
+  function showDone(imported,skipped){
+    const allGood=!failedEntries.length;
+    $('tsun-done-emoji').textContent=allGood?'🎉':'⚠️';
+    $('tsun-done-title').textContent=allGood?'Import Complete!':'Import Done';
+    $('tsun-done-sub').innerHTML=`${imported} imported &nbsp;·&nbsp; ${skipped} skipped &nbsp;·&nbsp; ${failedEntries.length} failed`;
+    doneBox.classList.add('show');
+    if(allGood) confetti();
+    progSec.classList.remove('show');pauseBtn.classList.remove('show');cancelBtn.classList.remove('show');
+    startBtn.disabled=true;dz.classList.remove('locked');
+    setDot(failedEntries.length?'error':'done');
+    if(failedEntries.length){buildFails();failsSec.classList.add('show');retryBtn.classList.add('show');logBtn.classList.add('show');}
+    if(failedEntries.filter(e=>e.url).length) expBtn.classList.add('show');
+    showToast(allGood?`Done! ${imported} manga imported`:`Done — ${failedEntries.length} failed`, allGood?'ok':'err');
+    updMini();
+  }
+
+  window.addEventListener('beforeunload',e=>{if(isRunning){e.preventDefault();e.returnValue='';}});
+
+  /* ── Start ──────────────────────────────────────────────────── */
+  startBtn.addEventListener('click',async()=>{
+    if(isRunning) return;
+    const resume=loadResume();let intoP2=false,resumedResolved=null;
+    if(resume&&resume.format===currentFormat){
+      const sr=loadResolved();
+      const rem=resume.phase===2?(sr?.length??0)-resume.index:(resume.queue?.length??0)-resume.index;
+      if(confirm(`Resume previous import? (${rem} entries left)`)){
+        importQueue=resume.queue;importIndex=resume.index;
+        if(currentFormat==='xml'&&resume.phase===2&&sr){intoP2=true;resumedResolved=sr;}
+      }else{clearResume();importQueue=getFiltered().map(e=>({...e}));importIndex=0;}
+    }else{clearResume();importQueue=getFiltered().map(e=>({...e}));importIndex=0;}
+
+    failedEntries=[];cStats.exact=cStats.found=cStats.fail=0;
+    [pvSec,sumBox,sf].forEach(el=>el.classList.remove('show'));
+    progSec.classList.add('show');pauseBtn.classList.add('show');
+    startBtn.disabled=true;doneBox.classList.remove('show');failsSec.classList.remove('show');
+    [retryBtn,logBtn,expBtn].forEach(el=>el.classList.remove('show'));
+    dz.classList.add('locked');setDot('running');bgNotify('IMPORT_STARTED');
+    updMini();
+
+    if(currentFormat==='xml'){confBox.classList.add('show');await runMAL(intoP2?resumedResolved:null);}
+    else await runDirect();
+  });
+
+  pauseBtn.addEventListener('click',()=>{
+    isPaused=!isPaused;
+    pauseBtn.textContent=isPaused?'▶ Resume':'⏸ Pause';
+    cancelBtn.classList.toggle('show',isPaused);
+    setDot(isPaused?'paused':'running');
+    showToast(isPaused?'Paused — press Space to resume':'Resumed');
+  });
+  cancelBtn.addEventListener('click',()=>{if(!isPaused)return;isCancelled=true;isPaused=false;});
+
+  retryBtn.addEventListener('click',async()=>{
+    if(isRunning)return;
+    [retryBtn,logBtn,expBtn].forEach(el=>el.classList.remove('show'));
+    doneBox.classList.remove('show');failsSec.classList.remove('show');
+    cStats.exact=cStats.found=cStats.fail=0;updConf();
+    importQueue=[...failedEntries];failedEntries=[];importIndex=0;
+    progSec.classList.add('show');pauseBtn.classList.add('show');
+    startBtn.disabled=true;isPaused=false;isCancelled=false;pauseBtn.textContent='⏸ Pause';
+    dz.classList.add('locked');setDot('running');
+    if(currentFormat==='xml')await runMAL(null);else await runDirect();
+  });
+
+  logBtn.addEventListener('click',()=>{
+    const el=Object.assign(document.createElement('a'),{href:URL.createObjectURL(new Blob([failedEntries.map(e=>`[${e.reason||'?'}] ${e.title||e.url||e.malId||'—'}`).join('\n')],{type:'text/plain'})),download:'tsun_errors.txt'});
+    el.click();URL.revokeObjectURL(el.href);showToast('Error log downloaded');
+  });
+
+  function handleCancel(){
+    isRunning=false;isCancelled=false;isPaused=false;
+    [pauseBtn,cancelBtn].forEach(el=>el.classList.remove('show'));
+    progSec.classList.remove('show');dz.classList.remove('locked');
+    clearResume();bgNotify('IMPORT_DONE');setDot('paused');
+    if(failedEntries.length){buildFails();failsSec.classList.add('show');logBtn.classList.add('show');}
+    doneBox.classList.add('show');
+    $('tsun-done-emoji').textContent='⏹';
+    $('tsun-done-title').textContent='Import Cancelled';
+    $('tsun-done-sub').textContent=`${failedEntries.length} entries not imported`;
+    showToast('Import cancelled','err');updMini();
+  }
+
+  /* ── MAL import ─────────────────────────────────────────────── */
+  async function runMAL(resumedResolved=null){
+    isRunning=true;isCancelled=false;
+    const total=importQueue.length;let resolved=resumedResolved?[...resumedResolved]:[];
+    if(!resumedResolved){
+      setPhase('ph-res','Phase 1 — Resolving titles','ph-res-bar');
+      await ensureTrackerMap();p1Start=Date.now();
+      let nextIdx=importIndex,doneCount=importIndex;
+      async function worker(){
+        while(true){
+          while(isPaused&&!isCancelled)await sleep(150);
+          if(isCancelled)return;
+          const i=nextIdx++;if(i>=total)return;
+          const entry=importQueue[i];
+          const{atsuId,confidence}=await resolveEntry(entry);
+          if(isCancelled)return;
+          if(atsuId){resolved.push({...entry,atsuId,confidence});cStats[confidence==='exact'?'exact':'found']++;}
+          else{cStats.fail++;failedEntries.push({...entry,reason:'Not found in tracker or search'});}
+          doneCount++;setProgress(doneCount,total,entry.title);updConf();updSpd(doneCount-importIndex,total-importIndex);
+          if(i>importIndex){importIndex=i;saveResume({phase:1});}
+          await sleep(SEARCH_DELAY_MS);
         }
-      } else {
-        clearResumeState();
-        importQueue = buildImportQueue(getFilteredEntries());
-        importIndex = 0;
       }
-    } else {
-      clearResumeState();
-      importQueue = buildImportQueue(getFilteredEntries());
-      importIndex = 0;
+      await Promise.all(Array.from({length:SEARCH_CONCURRENCY},(_,k)=>sleep(k*40).then(worker)));
+      if(isCancelled){handleCancel();return;}
     }
-
-    // Shared setup — runs unconditionally before any branch (Bug fix A)
-    failedEntries = []; currentPhase2Resolved = [];
-    confStats.exact = confStats.alt = confStats.fuzzy = confStats.failed = 0;
-    loadMALCache();
-
-    previewSection.classList.remove('visible');
-    summary.classList.remove('visible');
-    statusFilter.classList.remove('visible');
-    progressSection.classList.add('visible');
-    pauseBtn.classList.add('visible');
-    startBtn.disabled = true;
-    doneBox.classList.remove('visible');
-    failedSection.classList.remove('visible');
-    [retryBtn, logBtn, exportBtn].forEach(el => el.classList.remove('visible'));
-    dropzone.classList.add('running-lock');
-
-    bgNotify('IMPORT_STARTED');
-
-    if (currentFormat === 'xml') {
-      confidenceBox.classList.add('visible');
-      await runMALImport(resumeIntoPhase2 ? resumedResolved : null);
-    } else {
-      await runDirectImport();
+    spdLbl.textContent='';spdLbl.className='';
+    const p2Start=resumedResolved?importIndex:0;
+    importIndex=0;saveResolved(resolved);saveResume({phase:2});
+    setPhase('ph-imp','Phase 2 — Posting bookmarks');
+    let imported=0,skipped=0;
+    const bms=resolved.slice(p2Start).map(e=>({mangaId:e.atsuId,status:STATUS_MAP[e.status]||'PlanToRead',synced:false,ts:Date.now(),type:'Manga'}));
+    for(let i=0;i<bms.length;i+=BOOKMARK_CHUNK){
+      while(isPaused&&!isCancelled)await sleep(300);
+      if(isCancelled){importIndex=p2Start+i;handleCancel();return;}
+      const chunk=bms.slice(i,i+BOOKMARK_CHUNK);
+      setProgress(Math.min(i+BOOKMARK_CHUNK,bms.length),bms.length,'Posting bookmarks…');
+      const ok=await postBookmarks(chunk);
+      if(ok)imported+=chunk.length;
+      else{skipped+=chunk.length;chunk.forEach((_,j)=>{const e=resolved[p2Start+i+j];if(e)failedEntries.push({...e,reason:'Bookmark POST failed'});});}
+      await sleep(BOOKMARK_DELAY_MS);
     }
-  });
-
-  function buildImportQueue(entries) { return entries.map(e => ({ ...e })); }
-
-  /* ═══════════════════════════════════════════════════════════════
-     PAUSE / CANCEL
-  ═══════════════════════════════════════════════════════════════ */
-  pauseBtn.addEventListener('click', () => {
-    isPaused = !isPaused;
-    pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
-    cancelBtn.classList.toggle('visible', isPaused);
-  });
-
-  cancelBtn.addEventListener('click', () => {
-    if (!isPaused) return; // only cancellable while paused
-    isCancelled = true;
-    isPaused    = false;   // unblock the while(isPaused) spin so cancel propagates immediately
-  });
-
-  /* ═══════════════════════════════════════════════════════════════
-     RETRY ALL FAILED
-  ═══════════════════════════════════════════════════════════════ */
-  retryBtn.addEventListener('click', async () => {
-    if (isRunning) return;
-
-    retryBtn.classList.remove('visible');
-    logBtn.classList.remove('visible');
-    exportBtn.classList.remove('visible');
-    doneBox.classList.remove('visible');
-    failedSection.classList.remove('visible');
-
-    confStats.exact = confStats.alt = confStats.fuzzy = confStats.failed = 0;
-    updateConfidence();
-
-    // Capture before clearing failedEntries — avoids stale-ref bugs
-    let retryResumedResolved = null;
-    if (currentFormat === 'xml') {
-      const needsResolution = failedEntries.filter(e => !e.muUrl);
-      const alreadyResolved = failedEntries.filter(e =>  e.muUrl);
-      needsResolution.forEach(e => { if (e.malId) delete malResolutionCache[e.malId]; });
-      saveMALCache();
-      retryResumedResolved = alreadyResolved.length ? alreadyResolved : null;
-      failedEntries = [];
-      importQueue   = needsResolution;
-      importIndex   = 0;
-      currentPhase2Resolved = [];
-    } else {
-      importQueue   = [...failedEntries];
-      failedEntries = [];
-      importIndex   = 0;
-    }
-
-    progressSection.classList.add('visible');
-    pauseBtn.classList.add('visible');
-    startBtn.disabled = true;
-    isPaused = false; isCancelled = false;
-    pauseBtn.textContent = 'Pause';
-    dropzone.classList.add('running-lock');
-
-    if (currentFormat === 'xml') {
-      await runMALImport(retryResumedResolved);
-    } else {
-      await runDirectImport();
-    }
-  });
-
-  /* ═══════════════════════════════════════════════════════════════
-     ERROR LOG DOWNLOAD
-  ═══════════════════════════════════════════════════════════════ */
-  logBtn.addEventListener('click', () => {
-    const lines = failedEntries.map(e =>
-      `[${e.reason || 'Unknown'}] ${e.title || e.url || e.malId || '—'}`
-    );
-    const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
-    const a    = document.createElement('a');
-    a.href     = URL.createObjectURL(blob);
-    a.download = 'tsun_import_errors.txt';
-    a.click();
-    URL.revokeObjectURL(a.href);
-  });
-
-  /* ═══════════════════════════════════════════════════════════════
-     HANDLE CANCELLATION
-  ═══════════════════════════════════════════════════════════════ */
-  function handleCancellation() {
-    isRunning   = false;
-    isCancelled = false;
-    isPaused    = false;
-    pauseBtn.classList.remove('visible');
-    cancelBtn.classList.remove('visible');
-    progressSection.classList.remove('visible');
-    dropzone.classList.remove('running-lock');
-    clearResumeState();
-    bgNotify('IMPORT_DONE');
-
-    // Show export option if there are resolved URLs to save
-    const urls = getExportableUrls();
-    if (urls.length) {
-      doneBox.classList.add('visible');
-      $('tsun-done-title').textContent = '⚠ Import Cancelled';
-      $('tsun-done-sub').textContent   = `${urls.length} resolved entries ready to export`;
-      exportBtn.classList.add('visible');
-    }
-    if (failedEntries.length) {
-      buildFailedList();
-      failedSection.classList.add('visible');
-      logBtn.classList.add('visible');
-    }
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     MAL IMPORT  (2-phase)
-  ═══════════════════════════════════════════════════════════════ */
-  async function runMALImport(resumedResolved = null) {
-    isRunning = true;
-    isCancelled = false;
-    const total    = importQueue.length;
-    let   resolved = resumedResolved ? [...resumedResolved] : [];
-
-    // ── Phase 1: Resolve MAL → MU URLs ──
-    if (!resumedResolved) {
-      setPhase('resolve', 'Phase 1 — Resolving via MangaUpdates API');
-
-      for (let i = importIndex; i < total; i++) {
-        while (isPaused && !isCancelled) await sleep(300);
-        if (isCancelled) { currentPhase2Resolved = resolved; handleCancellation(); return; }
-
-        importIndex = i;
-        saveResumeState({ phase: 1 });
-
-        const entry = importQueue[i];
-        setProgress(i + 1, total, entry.title);
-
-        const { muUrl, confidence } = await resolveMALEntry(entry);
-        // Check cancel again — resolveMALEntry may have returned early due to isCancelled during rate-limit wait
-        if (isCancelled) { currentPhase2Resolved = resolved; handleCancellation(); return; }
-
-        if (muUrl) {
-          resolved.push({ ...entry, muUrl, confidence });
-          confStats[confidence]++;
-        } else {
-          confStats.failed++;
-          failedEntries.push({ ...entry, reason: 'No MangaUpdates match found' });
-        }
-        updateConfidence();
-        await sleep(MU_BASE_DELAY_MS);
+    const withProg=resolved.filter(e=>e.chaptersRead>0);
+    if(withProg.length){
+      setPhase('ph-ch','Phase 3 — Syncing chapters','ph-ch-bar');
+      for(let i=0;i<withProg.length;i++){
+        while(isPaused&&!isCancelled)await sleep(300);
+        if(isCancelled)break;
+        setProgress(i+1,withProg.length,withProg[i].title);
+        await syncChapter(withProg[i].atsuId,withProg[i].chaptersRead);
+        await sleep(200);
       }
     }
+    importIndex=resolved.length;clearResume();isRunning=false;bgNotify('IMPORT_DONE');showDone(imported,skipped);
+  }
 
-    // Save resolved to its own key ONCE before Phase 2 (Bug fix B+C)
-    // Bug fix 1: capture p2Start BEFORE resetting importIndex — after the reset
-    // importIndex is 0, so computing it afterwards always gives 0 regardless of resume.
-    const p2Start = resumedResolved ? importIndex : 0;
-    importIndex = 0; // reset so per-iteration checkpoints store correct Phase 2 positions
-    currentPhase2Resolved = resolved;
-    saveResumeResolved(resolved);
-    saveResumeState({ phase: 2 });
-
-    // ── Phase 2: Import to Atsu ──
-    setPhase('import', 'Phase 2 — Importing to Atsu.moe');
-    let imported = 0, skipped = 0;
-
-    for (let i = p2Start; i < resolved.length; i++) {
-      while (isPaused && !isCancelled) await sleep(300);
-      if (isCancelled) { importIndex = i; handleCancellation(); return; }
-
-      importIndex = i;
-      saveResumeState({ phase: 2 }); // only checkpoint the index
-
-      const entry = resolved[i];
-      setProgress(i + 1, resolved.length, entry.title);
-      skippedText.textContent = `${skipped} skipped`;
-
-      const seriesId = await getAtsuSeriesId(entry.muUrl);
-      if (!seriesId) {
-        failedEntries.push({ ...entry, reason: 'Series not found on Atsu' });
-        confStats.failed++; updateConfidence(); continue;
+  /* ── Direct import ──────────────────────────────────────────── */
+  async function runDirect(){
+    isRunning=true;isCancelled=false;
+    const total=importQueue.length;let imported=0,skipped=0;
+    await ensureTrackerMap();
+    setPhase('ph-res','Resolving titles','ph-res-bar');p1Start=Date.now();
+    const resolved=[];let nextIdx=importIndex,doneCount=importIndex;
+    async function dw(){
+      while(true){
+        while(isPaused&&!isCancelled)await sleep(150);
+        if(isCancelled)return;
+        const i=nextIdx++;if(i>=total)return;
+        const entry=importQueue[i];
+        const{atsuId,confidence}=await resolveEntry(entry);
+        if(isCancelled)return;
+        if(atsuId)resolved.push({...entry,atsuId,confidence});
+        else failedEntries.push({...entry,reason:'Not found'});
+        doneCount++;setProgress(doneCount,total,entry.title||entry.url);updSpd(doneCount,total);
+        await sleep(SEARCH_DELAY_MS);
       }
-      const ok = await bookmarkOnAtsu(seriesId, entry.chaptersRead);
-      if (ok) { imported++; }
-      else    { skipped++; failedEntries.push({ ...entry, reason: 'Already bookmarked or API error' }); }
-
-      await sleep(200);
     }
-
-    // Bug fix 2: advance importIndex to resolved.length so getExportableUrls slice is
-    // empty on normal completion — otherwise the last loop value (resolved.length-1)
-    // causes slice to return [lastEntry] and shows the Export Queue button erroneously.
-    importIndex = resolved.length;
-    clearResumeState();
-    isRunning = false;
-    bgNotify('IMPORT_DONE');
-    showDone(imported, skipped);
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     DIRECT IMPORT  (CSV / TXT)
-  ═══════════════════════════════════════════════════════════════ */
-  async function runDirectImport() {
-    isRunning   = true;
-    isCancelled = false;
-    const total = importQueue.length;
-    let imported = 0, skipped = 0;
-    setPhase('import', 'Importing to Atsu.moe');
-
-    for (let i = importIndex; i < total; i++) {
-      while (isPaused && !isCancelled) await sleep(300);
-      if (isCancelled) { importIndex = i; handleCancellation(); return; }
-
-      importIndex = i;
-      saveResumeState();
-
-      const entry = importQueue[i];
-      setProgress(i + 1, total, entry.title || entry.url);
-      skippedText.textContent = `${skipped} skipped`;
-
-      let muUrl = entry.url;
-      if (entry.source === 'comick') {
-        const map = await getTrackerMap();
-        muUrl = map[entry.url] || await searchAtsuForComick(entry);
-      }
-
-      if (!muUrl) { failedEntries.push({ ...entry, reason: 'Could not resolve to MU URL' }); continue; }
-
-      const seriesId = await getAtsuSeriesId(muUrl);
-      if (!seriesId) { failedEntries.push({ ...entry, reason: 'Series not found on Atsu' }); continue; }
-
-      const ok = await bookmarkOnAtsu(seriesId, entry.chapter || 0);
-      if (ok) { imported++; }
-      else    { skipped++; }
-
-      await sleep(200);
+    await Promise.all(Array.from({length:SEARCH_CONCURRENCY},(_,k)=>sleep(k*40).then(dw)));
+    if(isCancelled){handleCancel();return;}
+    spdLbl.textContent='';spdLbl.className='';
+    setPhase('ph-imp','Posting bookmarks');
+    const bms=resolved.map(e=>({mangaId:e.atsuId,status:'PlanToRead',synced:false,ts:Date.now(),type:'Manga'}));
+    for(let i=0;i<bms.length;i+=BOOKMARK_CHUNK){
+      while(isPaused&&!isCancelled)await sleep(300);
+      if(isCancelled){handleCancel();return;}
+      const ok=await postBookmarks(bms.slice(i,i+BOOKMARK_CHUNK));
+      if(ok)imported+=Math.min(BOOKMARK_CHUNK,bms.length-i);else skipped+=Math.min(BOOKMARK_CHUNK,bms.length-i);
+      setProgress(Math.min(i+BOOKMARK_CHUNK,bms.length),bms.length,'Posting bookmarks…');
+      await sleep(BOOKMARK_DELAY_MS);
     }
-
-    clearResumeState();
-    isRunning = false;
-    bgNotify('IMPORT_DONE');
-    showDone(imported, skipped);
+    clearResume();isRunning=false;bgNotify('IMPORT_DONE');showDone(imported,skipped);
   }
 
-  async function searchAtsuForComick(entry) {
-    try {
-      const res  = await fetch(`${ATSU_SEARCH_URL}?q=${encodeURIComponent(entry.title)}`);
-      const data = await res.json();
-      return data?.results?.[0]?.muUrl ?? null;
-    } catch { return null; }
-  }
+  function bgNotify(type){try{if(typeof chrome!=='undefined'&&chrome.runtime?.sendMessage)chrome.runtime.sendMessage({type});}catch{}}
+  try{if(typeof chrome!=='undefined'&&chrome.runtime?.onMessage){chrome.runtime.onMessage.addListener(msg=>{if(msg.type==='AUTO_RESUME'){if(collapsed){$('tsun-body').style.display='';collapsed=false;}const s=loadResume();if(s&&!isRunning)startBtn.click();}});}}catch{}
 
-  /* ═══════════════════════════════════════════════════════════════
-     BACKGROUND MESSAGING  (navigation persistence)
-  ═══════════════════════════════════════════════════════════════ */
-  function bgNotify(type) {
-    try { if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) chrome.runtime.sendMessage({ type }); }
-    catch { /* extension context invalidated — safe to ignore */ }
-  }
+  function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
-  // Listen for AUTO_RESUME from background when we navigate back to atsu.moe
-  try {
-    if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
-      chrome.runtime.onMessage.addListener((msg) => {
-        if (msg.type === 'AUTO_RESUME') {
-          // Expand panel and surface the resume prompt
-          if (collapsed) toggleCollapse();
-          const saved = loadResumeState();
-          if (saved && !isRunning) startBtn.click();
-        }
-      });
-    }
-  } catch { /* extension context not available */ }
-
-  /* ═══════════════════════════════════════════════════════════════
-     UTILITY
-  ═══════════════════════════════════════════════════════════════ */
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-  /* ═══════════════════════════════════════════════════════════════
-     ON LOAD — resume banner
-  ═══════════════════════════════════════════════════════════════ */
-  const savedResume = loadResumeState();
-  if (savedResume) {
-    const savedResolved = loadResumeResolved();
-    const remaining = savedResume.phase === 2
-      ? (savedResolved?.length ?? 0) - savedResume.index
-      : (savedResume.queue?.length ?? 0) - savedResume.index;
-    const bar = document.createElement('div');
-    bar.style.cssText = `
-      position:fixed; top:0; left:0; right:0;
-      background:#111120; color:#de4dae;
-      font-family:'Syne',sans-serif; font-size:12px; font-weight:600;
-      padding:9px 18px; text-align:center;
-      z-index:100000; cursor:pointer;
-      border-bottom:1px solid #2a1a3a;
-      animation: tsun-fadeSlideUp 0.3s both;
-    `;
-    bar.textContent = `Tsun Importer — unfinished import (${remaining} entries left). Click to dismiss, then open the panel to resume.`;
-    bar.addEventListener('click', () => bar.remove());
-    document.body.prepend(bar);
-    bgNotify('RESUME_AVAILABLE');
-  }
+  /* ── Resume banner ──────────────────────────────────────────── */
+  (()=>{
+    const s=loadResume();if(!s)return;
+    const sr=loadResolved();
+    const rem=s.phase===2?(sr?.length??0)-s.index:(s.queue?.length??0)-s.index;
+    const bar=document.createElement('div');
+    bar.style.cssText="position:fixed;top:0;left:0;right:0;background:rgba(8,8,16,.94);backdrop-filter:blur(16px);color:#de4dae;font-family:'Syne',sans-serif;font-size:12px;font-weight:600;padding:9px 18px;text-align:center;z-index:2147483646;cursor:pointer;border-bottom:1px solid rgba(222,77,174,.22);animation:t-up .3s both;";
+    bar.textContent=`Tsun Importer — unfinished import (${rem} entries left). Click to dismiss · open panel to resume.`;
+    bar.addEventListener('click',()=>bar.remove());
+    document.body.prepend(bar);bgNotify('RESUME_AVAILABLE');
+  })();
 
 })();
